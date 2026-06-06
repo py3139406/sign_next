@@ -1,13 +1,21 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:convert';
-import 'package:flutter/foundation.dart' show kIsWeb;
+import 'dart:ui' as ui;
+import 'dart:typed_data';
+import 'package:flutter/foundation.dart' show kIsWeb, compute;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_animate/flutter_animate.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:path/path.dart' as p;
+import 'package:image/image.dart' as img;
+import 'package:zxing2/qrcode.dart';
+import 'package:http/http.dart' as http;
+import 'package:pdf/pdf.dart';
+import 'package:pdf/widgets.dart' as pw;
 
 import 'services/signing_service.dart';
 import 'services/sharing_server.dart';
@@ -56,8 +64,9 @@ class PlatformDispatcherScreen extends StatefulWidget {
 
 class _PlatformDispatcherScreenState extends State<PlatformDispatcherScreen> {
   bool _authenticated = false;
-  bool _skipped = false;
   String? _userEmail;
+  bool _isRevoked = false;
+  bool _viewingAsAdmin = true;
 
   @override
   void initState() {
@@ -67,14 +76,62 @@ class _PlatformDispatcherScreenState extends State<PlatformDispatcherScreen> {
 
   Future<void> _checkPreviousLogin() async {
     final prefs = await SharedPreferences.getInstance();
+    final manualLogout = prefs.getBool('manual_logout') ?? false;
+
+    // Load parent emails from central DB
+    final parentEmails = await CentralDatabase.getParentEmails();
+
+    // Auto-detect git global email config
+    String? gitEmail;
+    try {
+      final gitEmailResult = await Process.run('git', ['config', '--global', 'user.email']);
+      if (gitEmailResult.exitCode == 0) {
+        final emailStr = (gitEmailResult.stdout as String).trim();
+        if (emailStr.isNotEmpty && emailStr.contains('@')) {
+          gitEmail = emailStr;
+        }
+      }
+    } catch (_) {}
+
+    // Check if auto-detecting a parent email and not manually logged out
+    if (gitEmail != null && parentEmails.contains(gitEmail) && !manualLogout) {
+      await prefs.setBool('is_authenticated', true);
+      await prefs.setString('user_email', gitEmail);
+      if (mounted) {
+        setState(() {
+          _authenticated = true;
+          _userEmail = gitEmail;
+          _viewingAsAdmin = true;
+        });
+      }
+      return;
+    }
+
     final authed = prefs.getBool('is_authenticated') ?? false;
-    final skipped = prefs.getBool('auth_skipped') ?? false;
     final email = prefs.getString('user_email');
+    
+    // Check if this child user is revoked
+    if (email != null && !parentEmails.contains(email)) {
+      final childUsers = await CentralDatabase.getChildUsers();
+      if (childUsers.containsKey(email)) {
+        final status = childUsers[email]['status'] ?? 'Active';
+        if (status == 'Revoked') {
+          if (mounted) {
+            setState(() {
+              _isRevoked = true;
+              _userEmail = email;
+            });
+          }
+          return;
+        }
+      }
+    }
+
     if (mounted) {
       setState(() {
         _authenticated = authed;
-        _skipped = skipped;
         _userEmail = email;
+        _viewingAsAdmin = email != null && parentEmails.contains(email);
       });
     }
   }
@@ -82,34 +139,60 @@ class _PlatformDispatcherScreenState extends State<PlatformDispatcherScreen> {
   void _onLoginSuccess(String email) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool('is_authenticated', true);
-    await prefs.setBool('auth_skipped', false);
+    await prefs.setBool('manual_logout', false);
     await prefs.setString('user_email', email);
+
+    final parentEmails = await CentralDatabase.getParentEmails();
+    final isParent = parentEmails.contains(email);
+
+    if (!isParent) {
+      // Register child user and log their login action
+      await CentralDatabase.updateChildUser(
+        email,
+        deviceName: Platform.localHostname,
+        osVersion: '${Platform.operatingSystem} ${Platform.operatingSystemVersion}',
+      );
+      await CentralDatabase.logAction(
+        email,
+        'Login',
+        'User successfully logged in via Microsoft SSO',
+        deviceName: Platform.localHostname,
+        osVersion: '${Platform.operatingSystem} ${Platform.operatingSystemVersion}',
+      );
+    }
+
     setState(() {
       _authenticated = true;
-      _skipped = false;
       _userEmail = email;
-    });
-  }
-
-  void _onSkipLogin() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool('is_authenticated', false);
-    await prefs.setBool('auth_skipped', true);
-    setState(() {
-      _authenticated = false;
-      _skipped = true;
+      _isRevoked = false;
+      _viewingAsAdmin = isParent;
     });
   }
 
   void _onLogout() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove('is_authenticated');
-    await prefs.remove('auth_skipped');
+    await prefs.setBool('manual_logout', true);
+    final email = _userEmail;
     await prefs.remove('user_email');
+    
+    if (email != null) {
+      final parentEmails = await CentralDatabase.getParentEmails();
+      if (!parentEmails.contains(email)) {
+        await CentralDatabase.logAction(
+          email,
+          'Logout',
+          'User logged out from application',
+          deviceName: Platform.localHostname,
+          osVersion: '${Platform.operatingSystem} ${Platform.operatingSystemVersion}',
+        );
+      }
+    }
+
     setState(() {
       _authenticated = false;
-      _skipped = false;
       _userEmail = null;
+      _isRevoked = false;
     });
   }
 
@@ -120,21 +203,62 @@ class _PlatformDispatcherScreenState extends State<PlatformDispatcherScreen> {
       return const MobileConnectionScreen();
     }
 
-    if (!_authenticated && !_skipped) {
-      return LoginScreen(
-        onLoginSuccess: _onLoginSuccess,
-        onSkip: _onSkipLogin,
+    if (_isRevoked) {
+      return AccessRevokedScreen(
+        userEmail: _userEmail ?? '',
+        onLogout: _onLogout,
       );
     }
 
-    return DashboardScreen(
-      userEmail: _userEmail,
-      onLogout: _onLogout,
+    if (!_authenticated) {
+      return LoginScreen(
+        onLoginSuccess: _onLoginSuccess,
+      );
+    }
+
+    return FutureBuilder<List<String>>(
+      future: CentralDatabase.getParentEmails(),
+      builder: (context, snapshot) {
+        if (!snapshot.hasData) {
+          return const Scaffold(
+            backgroundColor: Color(0xFF0F0F11),
+            body: Center(
+              child: CircularProgressIndicator(color: Color(0xFF8B5CF6)),
+            ),
+          );
+        }
+        
+        final parentList = snapshot.data!;
+        final isParent = _userEmail != null && parentList.contains(_userEmail);
+        
+        if (isParent && _viewingAsAdmin) {
+          return ParentDashboardWidget(
+            userEmail: _userEmail!,
+            onLogout: _onLogout,
+            onSwitchToChild: () {
+              setState(() {
+                _viewingAsAdmin = false;
+              });
+            },
+          );
+        } else {
+          return DashboardScreen(
+            userEmail: _userEmail,
+            onLogout: _onLogout,
+            isAdmin: isParent,
+            onSwitchToAdmin: () {
+              setState(() {
+                _viewingAsAdmin = true;
+              });
+            },
+          );
+        }
+      },
     );
   }
 }
 
-enum AppTab { sign, unsign, vault, settings }
+enum AppTab { sign, unsign, qrUtility, vault, devOps }
 
 // =============================================================================
 // DESKTOP INTERFACE
@@ -142,8 +266,16 @@ enum AppTab { sign, unsign, vault, settings }
 class DashboardScreen extends StatefulWidget {
   final String? userEmail;
   final VoidCallback? onLogout;
+  final bool isAdmin;
+  final VoidCallback? onSwitchToAdmin;
 
-  const DashboardScreen({super.key, this.userEmail, this.onLogout});
+  const DashboardScreen({
+    super.key,
+    this.userEmail,
+    this.onLogout,
+    this.isAdmin = false,
+    this.onSwitchToAdmin,
+  });
 
   @override
   State<DashboardScreen> createState() => _DashboardScreenState();
@@ -170,11 +302,83 @@ class _DashboardScreenState extends State<DashboardScreen> {
   // History list
   List<SignedAppHistoryItem> _recentApps = [];
 
+  // Central Management states
+  Timer? _syncTimer;
+  String _childRole = 'Role 1';
+  Map<String, dynamic>? _activeAlert;
+
   @override
   void initState() {
     super.initState();
     _loadProfiles();
     _loadRecentApps();
+    _initSyncTimer();
+  }
+
+  void _initSyncTimer() {
+    _checkStatusAndAlerts();
+    _syncTimer = Timer.periodic(const Duration(seconds: 4), (timer) {
+      _checkStatusAndAlerts();
+    });
+  }
+
+  Future<void> _checkStatusAndAlerts() async {
+    final email = widget.userEmail ?? '';
+    if (email.isEmpty) return;
+
+    final parentList = await CentralDatabase.getParentEmails();
+    if (parentList.contains(email)) {
+      if (_childRole != 'Role 2') {
+        if (mounted) {
+          setState(() {
+            _childRole = 'Role 2';
+          });
+        }
+      }
+      return;
+    }
+
+    final childUsers = await CentralDatabase.getChildUsers();
+    if (childUsers.containsKey(email)) {
+      final userData = childUsers[email];
+      final status = userData['status'] ?? 'Active';
+      if (status == 'Revoked') {
+        _syncTimer?.cancel();
+        if (widget.onLogout != null) {
+          widget.onLogout!();
+        }
+        return;
+      }
+      
+      final role = userData['role'] ?? 'Role 1';
+      if (role != _childRole) {
+        if (mounted) {
+          setState(() {
+            _childRole = role;
+          });
+        }
+      }
+    } else {
+      await CentralDatabase.updateChildUser(
+        email,
+        deviceName: Platform.localHostname,
+        osVersion: '${Platform.operatingSystem} ${Platform.operatingSystemVersion}',
+      );
+    }
+
+    // Check for unread alerts
+    final alerts = await CentralDatabase.getAlertsForUser(email);
+    for (final alert in alerts) {
+      final readBy = List<String>.from(alert['readBy'] ?? []);
+      if (!readBy.contains(email)) {
+        if (mounted) {
+          setState(() {
+            _activeAlert = alert;
+          });
+        }
+        break; 
+      }
+    }
   }
 
   Future<void> _loadProfiles() async {
@@ -211,6 +415,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
             filePath: app.filePath,
             platform: app.platform,
             date: app.date,
+            isSigned: app.isSigned,
           );
           needsSave = true;
         }
@@ -231,22 +436,30 @@ class _DashboardScreenState extends State<DashboardScreen> {
     final prefs = await SharedPreferences.getInstance();
     var updated = _recentApps.where((item) => item.filePath != app.filePath).toList();
     
-    final iosApps = updated.where((item) => item.platform == 'ios').toList();
-    final androidApps = updated.where((item) => item.platform == 'android').toList();
+    final iosSigned = updated.where((item) => item.platform == 'ios' && item.isSigned).toList();
+    final iosUnsigned = updated.where((item) => item.platform == 'ios' && !item.isSigned).toList();
+    final androidSigned = updated.where((item) => item.platform == 'android' && item.isSigned).toList();
+    final androidUnsigned = updated.where((item) => item.platform == 'android' && !item.isSigned).toList();
     
     if (app.platform == 'ios') {
-      if (iosApps.length >= 2) {
-        iosApps.removeAt(iosApps.length - 1);
+      if (app.isSigned) {
+        if (iosSigned.length >= 2) iosSigned.removeAt(iosSigned.length - 1);
+        iosSigned.insert(0, app);
+      } else {
+        if (iosUnsigned.length >= 2) iosUnsigned.removeAt(iosUnsigned.length - 1);
+        iosUnsigned.insert(0, app);
       }
-      iosApps.insert(0, app);
     } else {
-      if (androidApps.length >= 2) {
-        androidApps.removeAt(androidApps.length - 1);
+      if (app.isSigned) {
+        if (androidSigned.length >= 2) androidSigned.removeAt(androidSigned.length - 1);
+        androidSigned.insert(0, app);
+      } else {
+        if (androidUnsigned.length >= 2) androidUnsigned.removeAt(androidUnsigned.length - 1);
+        androidUnsigned.insert(0, app);
       }
-      androidApps.insert(0, app);
     }
     
-    updated = [...iosApps, ...androidApps];
+    updated = [...iosSigned, ...iosUnsigned, ...androidSigned, ...androidUnsigned];
     updated.sort((a, b) => b.date.compareTo(a.date));
     
     setState(() {
@@ -303,6 +516,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
   @override
   void dispose() {
+    _syncTimer?.cancel();
     _sharingServer.stop();
     super.dispose();
   }
@@ -310,31 +524,51 @@ class _DashboardScreenState extends State<DashboardScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: Row(
+      body: Stack(
         children: [
-          _buildSidebar(),
-          Expanded(
-            child: Container(
-              color: const Color(0xFF09090B),
-              child: SafeArea(
-                child: Column(
-                  children: [
-                    _buildTopBar(),
-                    Expanded(
-                      child: Padding(
-                        padding: const EdgeInsets.all(24.0),
-                        child: AnimatedSwitcher(
-                          duration: const Duration(milliseconds: 300),
-                          child: _buildCurrentTabContent(),
+          Row(
+            children: [
+              _buildSidebar(),
+              Expanded(
+                child: Container(
+                  color: const Color(0xFF09090B),
+                  child: SafeArea(
+                    child: Column(
+                      children: [
+                        _buildTopBar(),
+                        Expanded(
+                          child: Padding(
+                            padding: const EdgeInsets.all(24.0),
+                            child: AnimatedSwitcher(
+                              duration: const Duration(milliseconds: 300),
+                              child: _buildCurrentTabContent(),
+                            ),
+                          ),
                         ),
-                      ),
+                        if (_sharingUrl != null) _buildSharingStatusBar(),
+                      ],
                     ),
-                    if (_sharingUrl != null) _buildSharingStatusBar(),
-                  ],
+                  ),
                 ),
               ),
-            ),
+            ],
           ),
+          if (_activeAlert != null)
+            Positioned(
+              top: 24,
+              left: 280, 
+              right: 24,
+              child: SlideInAlertBanner(
+                alert: _activeAlert!,
+                onDismiss: () async {
+                  final alertId = _activeAlert!['id'];
+                  await CentralDatabase.markAlertAsRead(alertId, widget.userEmail ?? '');
+                  setState(() {
+                    _activeAlert = null;
+                  });
+                },
+              ),
+            ),
         ],
       ),
     );
@@ -349,216 +583,333 @@ class _DashboardScreenState extends State<DashboardScreen> {
           right: BorderSide(color: Color(0xFF27272A), width: 1),
         ),
       ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Padding(
-            padding: const EdgeInsets.only(top: 32.0, left: 24.0, bottom: 20.0),
-            child: Row(
-              children: [
-                Container(
-                  padding: const EdgeInsets.all(8),
-                  decoration: BoxDecoration(
-                    gradient: const LinearGradient(
-                      colors: [Color(0xFF8B5CF6), Color(0xFF10B981)],
-                    ),
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  child: const Icon(Icons.draw, color: Colors.white, size: 28),
-                ),
-                const SizedBox(width: 14),
-                const Column(
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          return SingleChildScrollView(
+            child: ConstrainedBox(
+              constraints: BoxConstraints(minHeight: constraints.maxHeight),
+              child: IntrinsicHeight(
+                child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(
-                      'SignNext',
-                      style: TextStyle(
-                        fontFamily: 'Inter',
-                        fontSize: 20,
-                        fontWeight: FontWeight.bold,
-                        letterSpacing: -0.5,
-                        color: Colors.white,
+                    Padding(
+                      padding: const EdgeInsets.only(top: 32.0, left: 24.0, bottom: 20.0),
+                      child: Row(
+                        children: [
+                          Container(
+                            padding: const EdgeInsets.all(8),
+                            decoration: BoxDecoration(
+                              gradient: const LinearGradient(
+                                colors: [Color(0xFF8B5CF6), Color(0xFF10B981)],
+                              ),
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                            child: const Icon(Icons.draw, color: Colors.white, size: 28),
+                          ),
+                          const SizedBox(width: 14),
+                          const Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                'SignNext',
+                                style: TextStyle(
+                                  fontFamily: 'Inter',
+                                  fontSize: 20,
+                                  fontWeight: FontWeight.bold,
+                                  letterSpacing: -0.5,
+                                  color: Colors.white,
+                                ),
+                              ),
+                              Text(
+                                'CRMNext Suite',
+                                style: TextStyle(
+                                  fontFamily: 'Inter',
+                                  fontSize: 11,
+                                  color: Color(0xFF71717A),
+                                  fontWeight: FontWeight.w500,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ],
                       ),
                     ),
-                    Text(
-                      'CRMNext Suite',
-                      style: TextStyle(
-                        fontFamily: 'Inter',
-                        fontSize: 11,
-                        color: Color(0xFF71717A),
-                        fontWeight: FontWeight.w500,
-                      ),
-                    ),
-                  ],
-                ),
-              ],
-            ),
-          ),
-          
-          // Profile Card
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
-            child: Container(
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: const Color(0xFF1E1E22),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: const Color(0xFF27272A)),
-              ),
-              child: Row(
-                children: [
-                  CircleAvatar(
-                    backgroundColor: widget.userEmail != null ? const Color(0xFF8B5CF6) : const Color(0xFF71717A),
-                    radius: 14,
-                    child: Icon(
-                      widget.userEmail != null ? Icons.person_rounded : Icons.person_outline_rounded,
-                      color: Colors.white,
-                      size: 14,
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          widget.userEmail != null ? 'Enterprise SSO' : 'Guest Mode',
-                          style: const TextStyle(
-                            fontFamily: 'Inter',
-                            fontSize: 10,
-                            color: Color(0xFF8B5CF6),
-                            fontWeight: FontWeight.bold,
+                    
+                      Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
+                        child: Container(
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF1E1E22),
+                            borderRadius: BorderRadius.circular(12),
+                            border: Border.all(color: const Color(0xFF27272A)),
+                          ),
+                          child: Row(
+                            children: [
+                              CircleAvatar(
+                                backgroundColor: const Color(0xFF8B5CF6),
+                                radius: 14,
+                                child: const Icon(
+                                  Icons.person_rounded,
+                                  color: Colors.white,
+                                  size: 14,
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      _childRole == 'Role 1' ? 'Standard Signer' : 'Administrator',
+                                      style: const TextStyle(
+                                        fontFamily: 'Inter',
+                                        fontSize: 10,
+                                        color: Color(0xFF8B5CF6),
+                                        fontWeight: FontWeight.bold,
+                                      ),
+                                    ),
+                                    Text(
+                                      widget.userEmail ?? 'Offline User',
+                                      style: const TextStyle(
+                                        fontFamily: 'Inter',
+                                        fontSize: 10,
+                                        color: Colors.white70,
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              const SizedBox(width: 4),
+                              IconButton(
+                                icon: const Icon(Icons.logout_rounded, size: 14, color: Color(0xFFEF4444)),
+                                tooltip: 'Log Out',
+                                constraints: const BoxConstraints(),
+                                padding: EdgeInsets.zero,
+                                onPressed: widget.onLogout,
+                              ),
+                            ],
                           ),
                         ),
-                        Text(
-                          widget.userEmail ?? 'Offline Guest',
-                          style: const TextStyle(
-                            fontFamily: 'Inter',
-                            fontSize: 10,
-                            color: Colors.white70,
-                            overflow: TextOverflow.ellipsis,
+                      ),
+                      if (widget.isAdmin) ...[
+                        Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 4.0),
+                          child: SizedBox(
+                            width: double.infinity,
+                            child: InkWell(
+                              onTap: widget.onSwitchToAdmin,
+                              borderRadius: BorderRadius.circular(8),
+                              child: Container(
+                                padding: const EdgeInsets.symmetric(vertical: 10),
+                                decoration: BoxDecoration(
+                                  gradient: const LinearGradient(
+                                    colors: [Color(0xFFEF4444), Color(0xFFF59E0B)],
+                                  ),
+                                  borderRadius: BorderRadius.circular(8),
+                                ),
+                                child: const Row(
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  children: [
+                                    Icon(Icons.admin_panel_settings_rounded, color: Colors.white, size: 14),
+                                    SizedBox(width: 8),
+                                    Text(
+                                      'Admin Control Center',
+                                      style: TextStyle(
+                                        fontFamily: 'Inter',
+                                        fontSize: 11,
+                                        fontWeight: FontWeight.bold,
+                                        color: Colors.white,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
                           ),
                         ),
                       ],
-                    ),
-                  ),
-                  const SizedBox(width: 4),
-                  IconButton(
-                    icon: const Icon(Icons.logout_rounded, size: 14, color: Color(0xFFEF4444)),
-                    tooltip: 'Log Out',
-                    constraints: const BoxConstraints(),
-                    padding: EdgeInsets.zero,
-                    onPressed: widget.onLogout,
-                  ),
-                ],
-              ),
-            ),
-          ),
-          const Divider(color: Color(0xFF27272A), height: 16),
-
-          _buildSidebarItem(tab: AppTab.sign, icon: Icons.vpn_key_rounded, label: 'Sign Studio', subtitle: 'Sign IPA, APK or AAB'),
-          _buildSidebarItem(tab: AppTab.unsign, icon: Icons.key_off_rounded, label: 'Unsign Studio', subtitle: 'Strip package signatures'),
-          _buildSidebarItem(tab: AppTab.vault, icon: Icons.admin_panel_settings_rounded, label: 'Profile Vault', subtitle: 'Manage secure credentials'),
-          _buildSidebarItem(tab: AppTab.settings, icon: Icons.settings_suggest_rounded, label: 'Settings', subtitle: 'Binary tool paths'),
+                      const Divider(color: Color(0xFF27272A), height: 16),
           
-          const Divider(color: Color(0xFF27272A), height: 16),
-
-          // Recent Signed Apps section
-          if (_recentApps.isNotEmpty) ...[
-            Expanded(
-              child: ListView(
-                padding: const EdgeInsets.symmetric(horizontal: 12),
-                children: [
-                  if (_recentApps.any((app) => app.platform == 'ios')) ...[
-                    const Padding(
-                      padding: EdgeInsets.symmetric(horizontal: 12.0, vertical: 8.0),
-                      child: Text(
-                        'RECENT iOS APPS',
-                        style: TextStyle(
-                          fontFamily: 'Inter',
-                          fontSize: 10,
-                          fontWeight: FontWeight.bold,
-                          color: Color(0xFF38BDF8),
-                          letterSpacing: 1.0,
+                    _buildSidebarItem(tab: AppTab.sign, icon: Icons.vpn_key_rounded, label: 'Sign Studio', subtitle: 'Sign IPA, APK or AAB'),
+                    _buildSidebarItem(tab: AppTab.unsign, icon: Icons.key_off_rounded, label: 'Unsign Studio', subtitle: 'Strip package signatures'),
+                    _buildSidebarItem(tab: AppTab.qrUtility, icon: Icons.qr_code_scanner_rounded, label: 'QR Utility', subtitle: 'Convert QR and text'),
+                    _buildSidebarItem(tab: AppTab.vault, icon: Icons.admin_panel_settings_rounded, label: 'Profile Vault', subtitle: 'Manage secure credentials'),
+                    _buildSidebarItem(tab: AppTab.devOps, icon: Icons.developer_board_rounded, label: 'DevOps Center', subtitle: 'Azure DevOps & AI Reporting'),
+                    
+                    const Divider(color: Color(0xFF27272A), height: 16),
+          
+                    // Recent Signed Apps section
+                    if (_recentApps.isNotEmpty) ...[
+                      Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 12),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            if (_recentApps.any((app) => app.platform == 'ios')) ...[
+                              const Padding(
+                                padding: EdgeInsets.symmetric(horizontal: 12.0, vertical: 8.0),
+                                child: Text(
+                                  'RECENT iOS APPS',
+                                  style: TextStyle(
+                                    fontFamily: 'Inter',
+                                    fontSize: 10,
+                                    fontWeight: FontWeight.bold,
+                                    color: Color(0xFF38BDF8),
+                                    letterSpacing: 1.0,
+                                  ),
+                                ),
+                              ),
+                              // iOS Signed Studio Apps
+                              if (_recentApps.any((app) => app.platform == 'ios' && app.isSigned)) ...[
+                                const Padding(
+                                  padding: EdgeInsets.only(left: 12.0, top: 4.0, bottom: 2.0),
+                                  child: Text(
+                                    'Signed Studio',
+                                    style: TextStyle(
+                                      fontFamily: 'Inter',
+                                      fontSize: 9,
+                                      fontWeight: FontWeight.bold,
+                                      color: Colors.grey,
+                                    ),
+                                  ),
+                                ),
+                                ..._recentApps
+                                    .where((app) => app.platform == 'ios' && app.isSigned)
+                                    .map((app) => _buildRecentAppItem(context, app)),
+                              ],
+                              // iOS Unsigned Studio Apps
+                              if (_recentApps.any((app) => app.platform == 'ios' && !app.isSigned)) ...[
+                                const Padding(
+                                  padding: EdgeInsets.only(left: 12.0, top: 4.0, bottom: 2.0),
+                                  child: Text(
+                                    'Unsigned Studio',
+                                    style: TextStyle(
+                                      fontFamily: 'Inter',
+                                      fontSize: 9,
+                                      fontWeight: FontWeight.bold,
+                                      color: Colors.grey,
+                                    ),
+                                  ),
+                                ),
+                                ..._recentApps
+                                    .where((app) => app.platform == 'ios' && !app.isSigned)
+                                    .map((app) => _buildRecentAppItem(context, app)),
+                              ],
+                            ],
+                            if (_recentApps.any((app) => app.platform == 'android')) ...[
+                              const Padding(
+                                padding: EdgeInsets.symmetric(horizontal: 12.0, vertical: 8.0),
+                                child: Text(
+                                  'RECENT ANDROID APPS',
+                                  style: TextStyle(
+                                    fontFamily: 'Inter',
+                                    fontSize: 10,
+                                    fontWeight: FontWeight.bold,
+                                    color: Color(0xFF10B981),
+                                    letterSpacing: 1.0,
+                                  ),
+                                ),
+                              ),
+                              // Android Signed Studio Apps
+                              if (_recentApps.any((app) => app.platform == 'android' && app.isSigned)) ...[
+                                const Padding(
+                                  padding: EdgeInsets.only(left: 12.0, top: 4.0, bottom: 2.0),
+                                  child: Text(
+                                    'Signed Studio',
+                                    style: TextStyle(
+                                      fontFamily: 'Inter',
+                                      fontSize: 9,
+                                      fontWeight: FontWeight.bold,
+                                      color: Colors.grey,
+                                    ),
+                                  ),
+                                ),
+                                ..._recentApps
+                                    .where((app) => app.platform == 'android' && app.isSigned)
+                                    .map((app) => _buildRecentAppItem(context, app)),
+                              ],
+                              // Android Unsigned Studio Apps
+                              if (_recentApps.any((app) => app.platform == 'android' && !app.isSigned)) ...[
+                                const Padding(
+                                  padding: EdgeInsets.only(left: 12.0, top: 4.0, bottom: 2.0),
+                                  child: Text(
+                                    'Unsigned Studio',
+                                    style: TextStyle(
+                                      fontFamily: 'Inter',
+                                      fontSize: 9,
+                                      fontWeight: FontWeight.bold,
+                                      color: Colors.grey,
+                                    ),
+                                  ),
+                                ),
+                                ..._recentApps
+                                    .where((app) => app.platform == 'android' && !app.isSigned)
+                                    .map((app) => _buildRecentAppItem(context, app)),
+                              ],
+                            ],
+                          ],
                         ),
                       ),
-                    ),
-                    ..._recentApps
-                        .where((app) => app.platform == 'ios')
-                        .map((app) => _buildRecentAppItem(context, app)),
-                  ],
-                  if (_recentApps.any((app) => app.platform == 'android')) ...[
-                    const Padding(
-                      padding: EdgeInsets.symmetric(horizontal: 12.0, vertical: 8.0),
-                      child: Text(
-                        'RECENT ANDROID APPS',
-                        style: TextStyle(
-                          fontFamily: 'Inter',
-                          fontSize: 10,
-                          fontWeight: FontWeight.bold,
-                          color: Color(0xFF10B981),
-                          letterSpacing: 1.0,
-                        ),
-                      ),
-                    ),
-                    ..._recentApps
-                        .where((app) => app.platform == 'android')
-                        .map((app) => _buildRecentAppItem(context, app)),
-                  ],
-                ],
-              ),
-            ),
-          ] else ...[
-            const Spacer(),
-          ],
-          
-          // Server mode widget inside sidebar
-          Padding(
-            padding: const EdgeInsets.all(16.0),
-            child: Container(
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: const Color(0xFF1E1E22),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: const Color(0xFF27272A)),
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      const Text(
-                        'Mobile Server Mode',
-                        style: TextStyle(fontFamily: 'Inter', fontSize: 12, fontWeight: FontWeight.bold, color: Colors.grey),
-                      ),
-                      Switch(
-                        value: false,
-                        activeColor: const Color(0xFF10B981),
-                        onChanged: null,
-                      ),
+                    ] else ...[
+                      const SizedBox(height: 20),
                     ],
-                  ),
-                  const SizedBox(height: 4),
-                  const Text(
-                    'Mobile Server Mode is currently disabled by enterprise policy.',
-                    style: TextStyle(fontFamily: 'Inter', fontSize: 10, color: Color(0xFF52525B)),
-                  ),
-                ],
+                    
+                    const Spacer(),
+                    
+                    // Server mode widget inside sidebar
+                    Padding(
+                      padding: const EdgeInsets.all(16.0),
+                      child: Container(
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF1E1E22),
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(color: const Color(0xFF27272A)),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                              children: [
+                                const Text(
+                                  'Mobile Server Mode',
+                                  style: TextStyle(fontFamily: 'Inter', fontSize: 12, fontWeight: FontWeight.bold, color: Colors.grey),
+                                ),
+                                Switch(
+                                  value: false,
+                                  activeColor: const Color(0xFF10B981),
+                                  onChanged: null,
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 4),
+                            const Text(
+                              'Mobile Server Mode is currently disabled by enterprise policy.',
+                              style: TextStyle(fontFamily: 'Inter', fontSize: 10, color: Color(0xFF52525B)),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 24.0, vertical: 12.0),
+                      child: Center(
+                        child: Text(
+                          'v1.0.0 • BusinessNext',
+                          style: TextStyle(fontFamily: 'Inter', fontSize: 11, color: Colors.grey[600]),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
               ),
             ),
-          ),
-          
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 24.0, vertical: 12.0),
-            child: Center(
-              child: Text(
-                'v1.0.0 • BusinessNext',
-                style: TextStyle(fontFamily: 'Inter', fontSize: 11, color: Colors.grey[600]),
-              ),
-            ),
-          ),
-        ],
+          );
+        },
       ),
     );
   }
@@ -662,6 +1013,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
   Widget _buildSidebarItem({required AppTab tab, required IconData icon, required String label, required String subtitle}) {
     final isSelected = _currentTab == tab;
+    final isLocked = _childRole == 'Role 1' && (tab == AppTab.vault);
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 12.0, vertical: 4.0),
       child: InkWell(
@@ -682,14 +1034,22 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(
-                      label,
-                      style: TextStyle(
-                        fontFamily: 'Inter',
-                        fontSize: 14,
-                        fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
-                        color: isSelected ? Colors.white : const Color(0xFFA1A1AA),
-                      ),
+                    Row(
+                      children: [
+                        Text(
+                          label,
+                          style: TextStyle(
+                            fontFamily: 'Inter',
+                            fontSize: 13,
+                            fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+                            color: isSelected ? Colors.white : const Color(0xFFA1A1AA),
+                          ),
+                        ),
+                        if (isLocked) ...[
+                          const SizedBox(width: 6),
+                          const Icon(Icons.lock_rounded, size: 12, color: Color(0xFFEF4444)),
+                        ],
+                      ],
                     ),
                     const SizedBox(height: 2),
                     Text(
@@ -724,13 +1084,17 @@ class _DashboardScreenState extends State<DashboardScreen> {
         title = 'Unsigning Studio';
         desc = 'Strip digital signatures and provisioning files from builds.';
         break;
+      case AppTab.qrUtility:
+        title = 'QR Utility';
+        desc = 'Convert Text to QR Codes and extract Text from QR Code images.';
+        break;
       case AppTab.vault:
         title = 'Profile Vault';
         desc = 'Manage secure credentials, P12 certs, Keystores, and credentials.';
         break;
-      case AppTab.settings:
-        title = 'Binary Settings';
-        desc = 'Configure local utility tool locations (zipalign, apksigner).';
+      case AppTab.devOps:
+        title = 'DevOps Center';
+        desc = 'Manage Azure DevOps tasks, pull requests, and generate AI reports.';
         break;
     }
 
@@ -763,6 +1127,15 @@ class _DashboardScreenState extends State<DashboardScreen> {
   }
 
   Widget _buildCurrentTabContent() {
+    if (_childRole == 'Role 1') {
+      if (_currentTab == AppTab.vault) {
+        return const AccessDeniedWidget(
+          title: 'Profile Vault Access Denied',
+          message: 'Standard Signers (Role 1) are not permitted to manage corporate codesigning profiles or cert credentials.',
+        );
+      }
+    }
+
     switch (_currentTab) {
       case AppTab.sign:
         return SignStudioWidget(
@@ -770,6 +1143,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
           profiles: _profiles,
           vaultService: _vaultService,
           userEmail: widget.userEmail,
+          userRole: _childRole,
           onStartSharing: (filePath, url) {
             setState(() {
               _sharingUrl = url;
@@ -778,14 +1152,43 @@ class _DashboardScreenState extends State<DashboardScreen> {
           },
           onSignSuccess: (appItem) {
             _addAppToHistory(appItem);
+            CentralDatabase.logAction(
+              widget.userEmail ?? 'unknown',
+              'Sign App',
+              'Successfully signed ${appItem.name} (${appItem.packageId})',
+              deviceName: Platform.localHostname,
+              osVersion: '${Platform.operatingSystem} ${Platform.operatingSystemVersion}',
+            );
           },
         );
       case AppTab.unsign:
-        return UnsignStudioWidget(signingService: _signingService);
+        return UnsignStudioWidget(
+          signingService: _signingService,
+          onUnsignSuccess: (appItem) {
+            _addAppToHistory(appItem);
+            CentralDatabase.logAction(
+              widget.userEmail ?? 'unknown',
+              'Unsign App',
+              'Successfully unsigned ${appItem.name} (${appItem.packageId})',
+              deviceName: Platform.localHostname,
+              osVersion: '${Platform.operatingSystem} ${Platform.operatingSystemVersion}',
+            );
+          },
+        );
+      case AppTab.qrUtility:
+        return const QrUtilityWidget();
       case AppTab.vault:
-        return VaultWidget(vaultService: _vaultService, onProfilesChanged: _loadProfiles);
-      case AppTab.settings:
-        return const SettingsWidget();
+        return VaultWidget(
+          vaultService: _vaultService,
+          onProfilesChanged: _loadProfiles,
+          onSelectTab: (tab) {
+            setState(() {
+              _currentTab = tab;
+            });
+          },
+        );
+      case AppTab.devOps:
+        return const DevOpsWidget();
     }
   }
 
@@ -1767,6 +2170,7 @@ class SignStudioWidget extends StatefulWidget {
   final Function(String filePath, String url) onStartSharing;
   final Function(SignedAppHistoryItem) onSignSuccess;
   final String? userEmail;
+  final String userRole;
 
   const SignStudioWidget({
     super.key,
@@ -1776,6 +2180,7 @@ class SignStudioWidget extends StatefulWidget {
     required this.onStartSharing,
     required this.onSignSuccess,
     this.userEmail,
+    required this.userRole,
   });
 
   @override
@@ -1799,6 +2204,8 @@ class _SignStudioWidgetState extends State<SignStudioWidget> {
   String? _iosProvPath;
   String? _androidKeystorePath;
   String? _selectedProfileId;
+  String? _zipalignPath;
+  String? _apksignerPath;
 
   List<SigningIdentity> _iosIdentities = [];
   String? _selectedIdentity;
@@ -1813,13 +2220,78 @@ class _SignStudioWidgetState extends State<SignStudioWidget> {
 
   final _sharingServer = SharingServer();
   bool _isSharing = false;
-  String? _sharingUrl;
+  bool _isUploading = false;
+  String _uploadStatus = '';
+  String? _sharingUrl;    // QR content (itms-services:// or https://)
+  String? _cloudFileUrl; // raw HTTPS file URL shown as copyable link
+  List<DeviceInstallLog> _installLogs = [];
+
+  List<Map<String, dynamic>> _globalCerts = [];
+  String? _selectedGlobalCertId;
 
   @override
   void initState() {
     super.initState();
+    if (!Platform.isMacOS) {
+      _platform = 'android';
+    }
     _loadSettingsDefaults().then((_) {
-      _loadLastProfile();
+      if (widget.userRole == 'Role 1') {
+        _loadGlobalCertificates();
+      }
+    });
+  }
+
+  @override
+  void didUpdateWidget(SignStudioWidget oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.userRole != oldWidget.userRole) {
+      if (widget.userRole == 'Role 1') {
+        _loadGlobalCertificates();
+      } else {
+        _selectedGlobalCertId = null;
+        _selectedProfileId = null;
+        _loadSettingsDefaults();
+      }
+    }
+  }
+
+  Future<void> _loadGlobalCertificates() async {
+    final certs = await CentralDatabase.getGlobalCertificates();
+    setState(() {
+      _globalCerts = certs;
+      // Auto-select first matching platform cert if available
+      final matching = certs.where((c) => c['platform'] == _platform).toList();
+      if (matching.isNotEmpty) {
+        _applyGlobalCertificate(matching.first);
+      } else {
+        _selectedGlobalCertId = null;
+        _iosP12Path = null;
+        _iosProvPath = null;
+        _selectedIdentity = null;
+        _androidKeystorePath = null;
+      }
+    });
+  }
+
+  void _applyGlobalCertificate(Map<String, dynamic> cert) {
+    setState(() {
+      _selectedGlobalCertId = cert['id'];
+      if (cert['platform'] == 'ios') {
+        _iosP12Path = cert['p12Path'];
+        _iosProvPath = cert['provPath'];
+        _iosP12PasswordController.text = cert['p12Password'] ?? '';
+        _iosKeychainPasswordController.text = cert['keychainPassword'] ?? '';
+        _selectedIdentity = cert['identity'];
+        if (_selectedIdentity != null) {
+          _iosIdentities = [SigningIdentity(fingerprint: _selectedIdentity!, name: _selectedIdentity!)];
+        }
+      } else {
+        _androidKeystorePath = cert['keystorePath'];
+        _androidKeyAliasController.text = cert['keyAlias'] ?? '';
+        _androidKeyPasswordController.text = cert['keyPassword'] ?? '';
+        _androidStorePasswordController.text = cert['storePassword'] ?? '';
+      }
     });
   }
 
@@ -1835,6 +2307,8 @@ class _SignStudioWidgetState extends State<SignStudioWidget> {
       _androidKeyAliasController.text = prefs.getString('android_key_alias') ?? '';
       _androidKeyPasswordController.text = prefs.getString('android_key_password') ?? '';
       _androidStorePasswordController.text = prefs.getString('android_store_password') ?? '';
+      _zipalignPath = prefs.getString('zipalign_path') ?? 'zipalign';
+      _apksignerPath = prefs.getString('apksigner_path') ?? 'apksigner';
     });
     if (_iosKeychainPasswordController.text.isNotEmpty) {
       _fetchIosIdentities();
@@ -1857,12 +2331,20 @@ class _SignStudioWidgetState extends State<SignStudioWidget> {
       if (profile.platform == 'ios') {
         _iosBundleIdController.text = profile.bundleId;
         _selectedIdentity = profile.selectedIdentity.isNotEmpty ? profile.selectedIdentity : null;
-        // P12 Path, Prov Path, and Passwords are NOT loaded from the profile, they are loaded from settings
+        _iosP12Path = profile.p12Path;
+        _iosProvPath = profile.provPath;
+        _iosP12PasswordController.text = profile.p12Password;
+        _iosKeychainPasswordController.text = profile.keychainPassword;
+        if (_iosKeychainPasswordController.text.isNotEmpty) {
+          _fetchIosIdentities();
+        }
       } else {
         _androidKeystorePath = profile.keystorePath;
         _androidKeyAliasController.text = profile.keyAlias;
         _androidKeyPasswordController.text = profile.keyPassword;
         _androidStorePasswordController.text = profile.storePassword;
+        _zipalignPath = profile.zipalignPath.isNotEmpty ? profile.zipalignPath : null;
+        _apksignerPath = profile.apksignerJarPath.isNotEmpty ? profile.apksignerJarPath : null;
       }
     });
   }
@@ -1909,7 +2391,11 @@ class _SignStudioWidgetState extends State<SignStudioWidget> {
       _signedFilePath = null;
       _signSuccess = false;
       _isSharing = false;
+      _isUploading = false;
+      _uploadStatus = '';
       _sharingUrl = null;
+      _cloudFileUrl = null;
+      _installLogs = [];
       _latestMetadata = null;
     });
   }
@@ -1992,8 +2478,8 @@ class _SignStudioWidgetState extends State<SignStudioWidget> {
 
         final prefs = await SharedPreferences.getInstance();
         if (_androidAppType == 'apk') {
-          final zipalign = prefs.getString('zipalign_path') ?? 'zipalign';
-          final apksigner = prefs.getString('apksigner_path') ?? 'apksigner';
+          final zipalign = _zipalignPath ?? prefs.getString('zipalign_path') ?? 'zipalign';
+          final apksigner = _apksignerPath ?? prefs.getString('apksigner_path') ?? 'apksigner';
           
           signStream = widget.signingService.signApk(
             apkPath: _unsignedPath!,
@@ -2108,22 +2594,68 @@ class _SignStudioWidgetState extends State<SignStudioWidget> {
 
   Future<void> _shareLocally() async {
     if (_signedFilePath == null) return;
+
     setState(() {
       _isSharing = true;
+      _isUploading = true;
+      _installLogs = [];
+      _uploadStatus = 'Starting secure sharing tunnel…';
     });
+
     try {
-      final url = await _sharingServer.start(_signedFilePath!);
-      setState(() {
-        _sharingUrl = url;
+      final bundleId = _latestMetadata?.packageId ?? 'com.example.app';
+      final version = _latestMetadata?.versionName ?? '1.0';
+      final appName = _latestMetadata?.name ?? 'App';
+
+      final otaResult = await _sharingServer.startOta(
+        _signedFilePath!,
+        bundleId: bundleId,
+        version: version,
+        appName: appName,
+      );
+
+      // Listen for download/install hits
+      _installLogs = _sharingServer.downloadLogs;
+      _sharingServer.logsStream.listen((logs) {
+        if (mounted) {
+          setState(() {
+            _installLogs = logs;
+          });
+        }
       });
-      widget.onStartSharing(_signedFilePath!, url);
-      _addLog('[SERVER] Sharing file locally at: $url');
+
+      final shareUrl = otaResult.publicUrl ?? otaResult.localUrl;
+      final fileUrl = '$shareUrl/download/${Uri.encodeComponent(p.basename(_signedFilePath!))}';
+
+      setState(() {
+        _isUploading = false;
+        _uploadStatus = '';
+        _sharingUrl = otaResult.qrUrl;
+        _cloudFileUrl = fileUrl;
+      });
+
+      widget.onStartSharing(_signedFilePath!, fileUrl);
+      _addLog('[SHARE] Share started. Tunnel: ${otaResult.publicUrl ?? "none"}');
     } catch (e) {
-      _addLog('[SERVER ERROR] Failed to start local server: $e');
+      _addLog('[ERROR] $e');
       setState(() {
         _isSharing = false;
+        _isUploading = false;
+        _uploadStatus = '';
       });
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to start sharing: $e'), backgroundColor: const Color(0xFFEF4444)),
+        );
+      }
     }
+  }
+
+  @override
+  void dispose() {
+    _sharingServer.stop();
+    _sharingServer.dispose();
+    super.dispose();
   }
 
   void _locateFile() {
@@ -2178,32 +2710,62 @@ class _SignStudioWidgetState extends State<SignStudioWidget> {
                     border: Border.all(color: const Color(0xFF27272A)),
                   ),
                   child: DropdownButtonHideUnderline(
-                    child: DropdownButton<String>(
-                      value: _selectedProfileId,
-                      hint: const Text(
-                        'Select Profile from Vault',
-                        style: TextStyle(fontFamily: 'Inter', fontSize: 13, color: Color(0xFF71717A)),
-                      ),
-                      isExpanded: true,
-                      dropdownColor: const Color(0xFF1E1E22),
-                      items: widget.profiles
-                          .where((p) => p.platform == _platform)
-                          .map((p) => DropdownMenuItem(
-                                value: p.id,
-                                child: Text(p.name, style: const TextStyle(fontFamily: 'Inter', fontSize: 14, color: Colors.white)),
-                              ))
-                          .toList(),
-                      onChanged: (val) {
-                        setState(() {
-                          _selectedProfileId = val;
-                        });
-                        if (val != null) {
-                          final profile = widget.profiles.firstWhere((p) => p.id == val);
-                          _applyProfile(profile);
-                          widget.vaultService.setLastUsedProfileId(_platform, val);
-                        }
-                      },
-                    ),
+                    child: widget.userRole == 'Role 1'
+                        ? DropdownButton<String>(
+                            value: _selectedGlobalCertId,
+                            hint: const Text(
+                              'Select Parent Global Certificate',
+                              style: TextStyle(fontFamily: 'Inter', fontSize: 13, color: Color(0xFF71717A)),
+                            ),
+                            isExpanded: true,
+                            dropdownColor: const Color(0xFF1E1E22),
+                            items: _globalCerts
+                                .where((c) => c['platform'] == _platform)
+                                .map((c) => DropdownMenuItem(
+                                      value: c['id'] as String,
+                                      child: Text(c['name'] as String, style: const TextStyle(fontFamily: 'Inter', fontSize: 14, color: Colors.white)),
+                                    ))
+                                .toList(),
+                            onChanged: (val) {
+                              if (val != null) {
+                                final cert = _globalCerts.firstWhere((c) => c['id'] == val);
+                                _applyGlobalCertificate(cert);
+                              }
+                            },
+                          )
+                        : DropdownButton<String?>(
+                            value: _selectedProfileId,
+                            hint: const Text(
+                              'Use Settings Defaults',
+                              style: TextStyle(fontFamily: 'Inter', fontSize: 13, color: Color(0xFF71717A)),
+                            ),
+                            isExpanded: true,
+                            dropdownColor: const Color(0xFF1E1E22),
+                            items: [
+                              const DropdownMenuItem<String?>(
+                                value: null,
+                                child: Text('Use Settings Defaults', style: TextStyle(fontFamily: 'Inter', fontSize: 14, color: Color(0xFFA1A1AA))),
+                              ),
+                              ...widget.profiles
+                                  .where((p) => p.platform == _platform)
+                                  .map((p) => DropdownMenuItem<String?>(
+                                        value: p.id,
+                                        child: Text(p.name, style: const TextStyle(fontFamily: 'Inter', fontSize: 14, color: Colors.white)),
+                                      )),
+                            ],
+                            onChanged: (val) {
+                              setState(() {
+                                _selectedProfileId = val;
+                              });
+                              if (val != null) {
+                                final profile = widget.profiles.firstWhere((p) => p.id == val);
+                                _applyProfile(profile);
+                                widget.vaultService.setLastUsedProfileId(_platform, val);
+                              } else {
+                                _loadSettingsDefaults();
+                              }
+                            },
+                          ),
                   ),
                 ),
               ),
@@ -2320,37 +2882,51 @@ class _SignStudioWidgetState extends State<SignStudioWidget> {
   }
 
   Widget _buildPlatformTab(String val, String title, IconData icon) {
+    final isIpaOnNonMac = val == 'ios' && !Platform.isMacOS;
     final active = _platform == val;
-    return InkWell(
-      onTap: () {
-        setState(() {
-          _platform = val;
-          _unsignedPath = null;
-          _selectedProfileId = null;
-        });
-        _loadLastProfile();
-      },
-      borderRadius: BorderRadius.circular(9),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-        decoration: BoxDecoration(
-          color: active ? const Color(0xFF8B5CF6) : Colors.transparent,
+
+    return Tooltip(
+      message: isIpaOnNonMac ? 'iOS signing requires macOS' : '',
+      child: Opacity(
+        opacity: isIpaOnNonMac ? 0.5 : 1.0,
+        child: InkWell(
+          onTap: isIpaOnNonMac
+              ? null
+              : () {
+                  setState(() {
+                    _platform = val;
+                    _unsignedPath = null;
+                    _selectedProfileId = null;
+                  });
+                  _loadSettingsDefaults();
+                },
           borderRadius: BorderRadius.circular(9),
-        ),
-        child: Row(
-          children: [
-            Icon(icon, color: active ? Colors.white : const Color(0xFFA1A1AA), size: 16),
-            const SizedBox(width: 8),
-            Text(
-              title,
-              style: TextStyle(
-                fontFamily: 'Inter',
-                fontSize: 13,
-                fontWeight: active ? FontWeight.bold : FontWeight.normal,
-                color: active ? Colors.white : const Color(0xFFA1A1AA),
-              ),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            decoration: BoxDecoration(
+              color: active ? const Color(0xFF8B5CF6) : Colors.transparent,
+              borderRadius: BorderRadius.circular(9),
             ),
-          ],
+            child: Row(
+              children: [
+                Icon(icon, color: active ? Colors.white : const Color(0xFFA1A1AA), size: 16),
+                const SizedBox(width: 8),
+                Text(
+                  title,
+                  style: TextStyle(
+                    fontFamily: 'Inter',
+                    fontSize: 13,
+                    fontWeight: active ? FontWeight.bold : FontWeight.normal,
+                    color: active ? Colors.white : const Color(0xFFA1A1AA),
+                  ),
+                ),
+                if (isIpaOnNonMac) ...[
+                  const SizedBox(width: 6),
+                  const Icon(Icons.lock_outline_rounded, size: 12, color: Color(0xFFA1A1AA)),
+                ],
+              ],
+            ),
+          ),
         ),
       ),
     );
@@ -2452,6 +3028,8 @@ class _SignStudioWidgetState extends State<SignStudioWidget> {
   }
 
   Widget _buildIosInputs() {
+    final isRole1 = widget.userRole == 'Role 1';
+    final hasProfile = _selectedProfileId != null || _selectedGlobalCertId != null;
     return _buildCard(
       title: 'iOS Certificate & Profile Settings',
       child: Column(
@@ -2469,22 +3047,32 @@ class _SignStudioWidgetState extends State<SignStudioWidget> {
               children: [
                 Row(
                   children: [
-                    const Icon(Icons.info_outline_rounded, color: Color(0xFF8B5CF6), size: 16),
+                    Icon(
+                      isRole1
+                          ? Icons.verified_user_rounded
+                          : (hasProfile ? Icons.account_balance_wallet_rounded : Icons.info_outline_rounded),
+                      color: const Color(0xFF8B5CF6),
+                      size: 16,
+                    ),
                     const SizedBox(width: 8),
-                    const Text(
-                      'Using Default iOS Settings (Configured in Settings)',
-                      style: TextStyle(fontFamily: 'Inter', fontSize: 11, fontWeight: FontWeight.bold, color: Color(0xFF8B5CF6)),
+                    Expanded(
+                      child: Text(
+                        isRole1
+                            ? 'Signing is secured by Parent Administrator credentials.'
+                            : (hasProfile ? 'Using Vault Profile Settings' : 'Using Default iOS Settings (Configured in Settings)'),
+                        style: const TextStyle(fontFamily: 'Inter', fontSize: 11, fontWeight: FontWeight.bold, color: Color(0xFF8B5CF6)),
+                      ),
                     ),
                   ],
                 ),
                 const SizedBox(height: 10),
                 Text(
-                  'P12 Certificate: ${_iosP12Path != null && _iosP12Path!.isNotEmpty ? p.basename(_iosP12Path!) : "Not configured in Settings"}',
+                  'P12 Certificate: ${_iosP12Path != null && _iosP12Path!.isNotEmpty ? p.basename(_iosP12Path!) : "Not configured"}',
                   style: const TextStyle(fontFamily: 'Inter', fontSize: 12, color: Colors.white70),
                 ),
                 const SizedBox(height: 6),
                 Text(
-                  'Provisioning Profile: ${_iosProvPath != null && _iosProvPath!.isNotEmpty ? p.basename(_iosProvPath!) : "Not configured in Settings"}',
+                  'Provisioning Profile: ${_iosProvPath != null && _iosProvPath!.isNotEmpty ? p.basename(_iosProvPath!) : "Not configured"}',
                   style: const TextStyle(fontFamily: 'Inter', fontSize: 12, color: Colors.white70),
                 ),
               ],
@@ -2502,63 +3090,66 @@ class _SignStudioWidgetState extends State<SignStudioWidget> {
               ),
             ],
           ),
-          const SizedBox(height: 14),
-          Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  const Text('Signing Identity (from Keychain)', style: TextStyle(fontFamily: 'Inter', fontSize: 13, color: Color(0xFFA1A1AA))),
-                  if (_loadingIdentities)
-                    const SizedBox(width: 12, height: 12, child: CircularProgressIndicator(strokeWidth: 1.5))
-                  else
-                    IconButton(
-                      icon: const Icon(Icons.refresh, size: 16, color: Color(0xFF10B981)),
-                      padding: EdgeInsets.zero,
-                      constraints: const BoxConstraints(),
-                      onPressed: _fetchIosIdentities,
-                    ),
-                ],
-              ),
-              const SizedBox(height: 6),
-              Container(
-                width: double.infinity,
-                padding: const EdgeInsets.symmetric(horizontal: 14),
-                decoration: BoxDecoration(
-                  color: const Color(0xFF0F0F12),
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: const Color(0xFF27272A)),
+          if (!isRole1) ...[
+            const SizedBox(height: 14),
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    const Text('Signing Identity (from Keychain)', style: TextStyle(fontFamily: 'Inter', fontSize: 13, color: Color(0xFFA1A1AA))),
+                    if (_loadingIdentities)
+                      const SizedBox(width: 12, height: 12, child: CircularProgressIndicator(strokeWidth: 1.5))
+                    else
+                      IconButton(
+                        icon: const Icon(Icons.refresh, size: 16, color: Color(0xFF10B981)),
+                        padding: EdgeInsets.zero,
+                        constraints: const BoxConstraints(),
+                        onPressed: _fetchIosIdentities,
+                      ),
+                  ],
                 ),
-                child: DropdownButtonHideUnderline(
-                  child: DropdownButton<String>(
-                    value: _selectedIdentity,
-                    hint: const Text('Select Key Identity', style: TextStyle(fontFamily: 'Inter', fontSize: 13, color: Color(0xFF52525B))),
-                    isExpanded: true,
-                    dropdownColor: const Color(0xFF1E1E22),
-                    items: _iosIdentities
-                        .map((id) => DropdownMenuItem(
-                              value: id.fingerprint,
-                              child: Text(id.name, style: const TextStyle(fontFamily: 'Inter', fontSize: 13, color: Colors.white), overflow: TextOverflow.ellipsis),
-                            ))
-                        .toList(),
-                    onChanged: (val) {
-                      setState(() {
-                        _selectedIdentity = val;
-                      });
-                    },
+                const SizedBox(height: 6),
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.symmetric(horizontal: 14),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF0F0F12),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: const Color(0xFF27272A)),
+                  ),
+                  child: DropdownButtonHideUnderline(
+                    child: DropdownButton<String>(
+                      value: _selectedIdentity,
+                      hint: const Text('Select Key Identity', style: TextStyle(fontFamily: 'Inter', fontSize: 13, color: Color(0xFF52525B))),
+                      isExpanded: true,
+                      dropdownColor: const Color(0xFF1E1E22),
+                      items: _iosIdentities
+                          .map((id) => DropdownMenuItem(
+                                value: id.fingerprint,
+                                child: Text(id.name, style: const TextStyle(fontFamily: 'Inter', fontSize: 13, color: Colors.white), overflow: TextOverflow.ellipsis),
+                              ))
+                          .toList(),
+                      onChanged: (val) {
+                        setState(() {
+                          _selectedIdentity = val;
+                        });
+                      },
+                    ),
                   ),
                 ),
-              ),
-            ],
-          ),
+              ],
+            ),
+          ],
         ],
       ),
     );
   }
 
   Widget _buildAndroidInputs() {
-    final hasProfile = _selectedProfileId != null;
+    final isRole1 = widget.userRole == 'Role 1';
+    final hasProfile = _selectedProfileId != null || _selectedGlobalCertId != null;
     return _buildCard(
       title: 'Android Keystore Settings',
       child: Column(
@@ -2577,16 +3168,20 @@ class _SignStudioWidgetState extends State<SignStudioWidget> {
                 Row(
                   children: [
                     Icon(
-                      hasProfile ? Icons.account_balance_wallet_rounded : Icons.info_outline_rounded,
+                      isRole1
+                          ? Icons.verified_user_rounded
+                          : (hasProfile ? Icons.account_balance_wallet_rounded : Icons.info_outline_rounded),
                       color: const Color(0xFF10B981),
                       size: 16,
                     ),
                     const SizedBox(width: 8),
-                    Text(
-                      hasProfile
-                          ? 'Using Vault Profile Settings'
-                          : 'Using Default Android Settings (Configured in Settings)',
-                      style: const TextStyle(fontFamily: 'Inter', fontSize: 11, fontWeight: FontWeight.bold, color: Color(0xFF10B981)),
+                    Expanded(
+                      child: Text(
+                        isRole1
+                            ? 'Signing is secured by Parent Administrator credentials.'
+                            : (hasProfile ? 'Using Vault Profile Settings' : 'Using Default Android Settings (Configured in Settings)'),
+                        style: const TextStyle(fontFamily: 'Inter', fontSize: 11, fontWeight: FontWeight.bold, color: Color(0xFF10B981)),
+                      ),
                     ),
                   ],
                 ),
@@ -2598,6 +3193,16 @@ class _SignStudioWidgetState extends State<SignStudioWidget> {
                 const SizedBox(height: 6),
                 Text(
                   'Key Alias: ${_androidKeyAliasController.text.isNotEmpty ? _androidKeyAliasController.text : "Not configured"}',
+                  style: const TextStyle(fontFamily: 'Inter', fontSize: 12, color: Colors.white70),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  'Zipalign Path: ${_zipalignPath != null && _zipalignPath!.isNotEmpty ? p.basename(_zipalignPath!) : "Default (zipalign)"}',
+                  style: const TextStyle(fontFamily: 'Inter', fontSize: 12, color: Colors.white70),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  'Apksigner Path: ${_apksignerPath != null && _apksignerPath!.isNotEmpty ? p.basename(_apksignerPath!) : "Default (apksigner)"}',
                   style: const TextStyle(fontFamily: 'Inter', fontSize: 12, color: Colors.white70),
                 ),
               ],
@@ -2691,6 +3296,8 @@ class _SignStudioWidgetState extends State<SignStudioWidget> {
   }
 
   Widget _buildSuccessSharingCard() {
+    final isIpa = _signedFilePath?.toLowerCase().endsWith('.ipa') == true;
+
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.all(20),
@@ -2702,6 +3309,7 @@ class _SignStudioWidgetState extends State<SignStudioWidget> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          // ── Header ───────────────────────────────────────────────────────
           Row(
             children: [
               Container(
@@ -2710,11 +3318,17 @@ class _SignStudioWidgetState extends State<SignStudioWidget> {
                 child: const Icon(Icons.check, color: Colors.white, size: 16),
               ),
               const SizedBox(width: 12),
-              const Text('Signed Artifact Available', style: TextStyle(fontFamily: 'Inter', fontSize: 14, fontWeight: FontWeight.bold, color: Color(0xFF38BDF8))),
+              const Text('Signed Artifact Available',
+                  style: TextStyle(fontFamily: 'Inter', fontSize: 14, fontWeight: FontWeight.bold, color: Color(0xFF38BDF8))),
             ],
           ),
           const SizedBox(height: 12),
-          Text(_signedFilePath != null ? p.basename(_signedFilePath!) : '', style: const TextStyle(fontFamily: 'Courier', fontSize: 12, color: Colors.white70)),
+          Text(
+            _signedFilePath != null ? p.basename(_signedFilePath!) : '',
+            style: const TextStyle(fontFamily: 'Courier', fontSize: 12, color: Colors.white70),
+          ),
+
+          // ── Metadata ─────────────────────────────────────────────────────
           if (_latestMetadata != null) ...[
             const SizedBox(height: 8),
             Container(
@@ -2727,7 +3341,8 @@ class _SignStudioWidgetState extends State<SignStudioWidget> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const Text('DEVELOPER METADATA', style: TextStyle(fontFamily: 'Inter', fontSize: 9, fontWeight: FontWeight.bold, color: Color(0xFF38BDF8), letterSpacing: 0.5)),
+                  const Text('DEVELOPER METADATA',
+                      style: TextStyle(fontFamily: 'Inter', fontSize: 9, fontWeight: FontWeight.bold, color: Color(0xFF38BDF8), letterSpacing: 0.5)),
                   const SizedBox(height: 8),
                   _buildMetaDetailRow('App Name', _latestMetadata!.name),
                   _buildMetaDetailRow('Package / Bundle ID', _latestMetadata!.packageId),
@@ -2736,52 +3351,250 @@ class _SignStudioWidgetState extends State<SignStudioWidget> {
               ),
             ),
           ],
+
+          // ── Action buttons ────────────────────────────────────────────────
           const SizedBox(height: 16),
           Row(
             children: [
               ElevatedButton.icon(
-                style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF1E293B), foregroundColor: Colors.white, shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8))),
+                style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF1E293B),
+                    foregroundColor: Colors.white,
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8))),
                 icon: const Icon(Icons.folder_open_rounded, size: 16),
                 label: const Text('Show in Finder', style: TextStyle(fontFamily: 'Inter', fontSize: 12)),
                 onPressed: _locateFile,
               ),
               const SizedBox(width: 10),
               ElevatedButton.icon(
-                style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF0369A1), foregroundColor: Colors.white, shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8))),
-                icon: const Icon(Icons.wifi_rounded, size: 16),
-                label: const Text('Start Network Share', style: TextStyle(fontFamily: 'Inter', fontSize: 12)),
-                onPressed: _isSharing ? null : _shareLocally,
+                style: ElevatedButton.styleFrom(
+                    backgroundColor: _isSharing ? const Color(0xFF14532D) : const Color(0xFF8B5CF6),
+                    foregroundColor: Colors.white,
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8))),
+                icon: Icon(_isUploading
+                    ? Icons.cloud_upload_rounded
+                    : _isSharing
+                        ? Icons.qr_code_rounded
+                        : Icons.qr_code_2_rounded,
+                    size: 16),
+                label: Text(
+                  _isUploading ? 'Uploading…' : _isSharing ? 'QR Ready' : 'Generate Install QR',
+                  style: const TextStyle(fontFamily: 'Inter', fontSize: 12),
+                ),
+                onPressed: (_isSharing || _isUploading) ? null : _shareLocally,
               ),
             ],
           ),
-          if (_sharingUrl != null) ...[
+
+          // ── Upload progress ───────────────────────────────────────────────
+          if (_isUploading) ...[
+            const SizedBox(height: 16),
+            Container(
+              padding: const EdgeInsets.all(14),
+              decoration: BoxDecoration(
+                color: const Color(0xFF0A0A0F),
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: const Color(0xFF1E293B)),
+              ),
+              child: Row(
+                children: [
+                  const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF8B5CF6)),
+                  ),
+                  const SizedBox(width: 14),
+                  Expanded(
+                    child: Text(
+                      _uploadStatus,
+                      style: const TextStyle(fontFamily: 'Inter', fontSize: 12, color: Colors.white70),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+
+          // ── QR + install panel (shown after upload) ───────────────────────
+          if (_sharingUrl != null && !_isUploading) ...[
             const SizedBox(height: 20),
             Row(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
+                // QR code
                 Container(
-                  color: Colors.white,
-                  padding: const EdgeInsets.all(6),
-                  child: QrImageView(data: _sharingUrl!, version: QrVersions.auto, size: 100.0),
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  padding: const EdgeInsets.all(8),
+                  child: QrImageView(data: _sharingUrl!, version: QrVersions.auto, size: 120.0),
                 ),
                 const SizedBox(width: 16),
                 Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      const Text('Scan QR to download directly to device', style: TextStyle(fontFamily: 'Inter', fontSize: 12, fontWeight: FontWeight.bold, color: Colors.white)),
-                      const SizedBox(height: 4),
-                      Text('Connect device to the same Wi-Fi network.', style: TextStyle(fontFamily: 'Inter', fontSize: 11, color: Colors.grey[400])),
+                      Text(
+                        isIpa ? 'Install on iPhone / iPad' : 'Install on Android',
+                        style: const TextStyle(fontFamily: 'Inter', fontSize: 13, fontWeight: FontWeight.bold, color: Colors.white),
+                      ),
+                      const SizedBox(height: 10),
+                      Text(
+                        isIpa
+                            ? '1. Scan QR with iPhone Camera\n2. Tap banner → tap Install\n3. Trust cert in Settings if needed'
+                            : '1. Scan QR with any camera app\n2. Browser downloads the APK\n3. Open file to install',
+                        style: const TextStyle(
+                          fontFamily: 'Inter',
+                          fontSize: 11,
+                          color: Color(0xFF94A3B8),
+                          height: 1.6,
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      // Green "works anywhere" badge
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF14532D),
+                          borderRadius: BorderRadius.circular(6),
+                        ),
+                        child: const Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(Icons.public_rounded, size: 11, color: Color(0xFF4ADE80)),
+                            SizedBox(width: 5),
+                            Text('Works on any network',
+                                style: TextStyle(fontFamily: 'Inter', fontSize: 10, color: Color(0xFF4ADE80), fontWeight: FontWeight.bold)),
+                          ],
+                        ),
+                      ),
                     ],
                   ),
-                )
+                ),
               ],
-            )
-          ]
+            ),
+
+            // Copyable link
+            if (_cloudFileUrl != null) ...[
+              const SizedBox(height: 14),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF0A0A0F),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: const Color(0xFF1E293B)),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(Icons.link_rounded, size: 13, color: Color(0xFF64748B)),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        _cloudFileUrl!,
+                        style: const TextStyle(fontFamily: 'Courier', fontSize: 10, color: Color(0xFF94A3B8)),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    GestureDetector(
+                      onTap: () async {
+                        // Copy to clipboard using standard Flutter Clipboard API
+                        await Clipboard.setData(ClipboardData(text: _cloudFileUrl!));
+                        if (mounted) {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(content: Text('Link copied to clipboard'), duration: Duration(seconds: 1)),
+                          );
+                        }
+                      },
+                      child: const Icon(Icons.copy_rounded, size: 13, color: Color(0xFF64748B)),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+            if (_installLogs.isNotEmpty) ...[
+              const SizedBox(height: 18),
+              const Divider(color: Color(0xFF1E293B)),
+              const SizedBox(height: 10),
+              Row(
+                children: [
+                  const Icon(Icons.devices_rounded, size: 14, color: Color(0xFF10B981)),
+                  const SizedBox(width: 8),
+                  Text(
+                    'Installed Devices (${_installLogs.length})',
+                    style: const TextStyle(
+                      fontFamily: 'Inter',
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                      color: Colors.white,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
+              ListView.separated(
+                shrinkWrap: true,
+                physics: const NeverScrollableScrollPhysics(),
+                itemCount: _installLogs.length,
+                separatorBuilder: (context, index) => const SizedBox(height: 6),
+                itemBuilder: (context, index) {
+                  final log = _installLogs[index];
+                  IconData platformIcon = Icons.device_unknown_rounded;
+                  Color platformColor = const Color(0xFF64748B);
+                  if (log.platform == 'iOS') {
+                    platformIcon = Icons.phone_iphone_rounded;
+                    platformColor = const Color(0xFF38BDF8);
+                  } else if (log.platform == 'Android') {
+                    platformIcon = Icons.android_rounded;
+                    platformColor = const Color(0xFF4ADE80);
+                  } else if (log.platform == 'Desktop') {
+                    platformIcon = Icons.laptop_mac_rounded;
+                    platformColor = const Color(0xFFFB7185);
+                  }
+
+                  return Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF0F0F13),
+                      borderRadius: BorderRadius.circular(6),
+                      border: Border.all(color: const Color(0xFF1E293B)),
+                    ),
+                    child: Row(
+                      children: [
+                        Icon(platformIcon, size: 14, color: platformColor),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            log.deviceName,
+                            style: const TextStyle(
+                              fontFamily: 'Inter',
+                              fontSize: 11,
+                              fontWeight: FontWeight.w500,
+                              color: Color(0xFFE2E8F0),
+                            ),
+                          ),
+                        ),
+                        Text(
+                          log.downloadedAt,
+                          style: const TextStyle(
+                            fontFamily: 'Courier',
+                            fontSize: 10,
+                            color: Color(0xFF64748B),
+                          ),
+                        ),
+                      ],
+                    ),
+                  );
+                },
+              ),
+            ],
+          ],
         ],
       ),
     ).animate().fade().slideY(begin: 0.1, end: 0, duration: 400.ms, curve: Curves.easeOutQuad);
   }
+
 
   Widget _buildMetaDetailRow(String label, String value) {
     return Padding(
@@ -2813,8 +3626,13 @@ class _SignStudioWidgetState extends State<SignStudioWidget> {
 // ==========================================
 class UnsignStudioWidget extends StatefulWidget {
   final SigningService signingService;
+  final Function(SignedAppHistoryItem) onUnsignSuccess;
 
-  const UnsignStudioWidget({super.key, required this.signingService});
+  const UnsignStudioWidget({
+    super.key,
+    required this.signingService,
+    required this.onUnsignSuccess,
+  });
 
   @override
   State<UnsignStudioWidget> createState() => _UnsignStudioWidgetState();
@@ -2891,10 +3709,35 @@ class _UnsignStudioWidgetState extends State<UnsignStudioWidget> {
       await for (final log in stream) {
         _addLog(log);
       }
+
+      AppMetadata? extractedMetadata;
+      try {
+        if (_platform == 'ios') {
+          extractedMetadata = MetadataService.parseFromFilename(p.basename(_outputPath!));
+        } else {
+          extractedMetadata = await MetadataService.extractApkMetadata(_outputPath!);
+        }
+      } catch (_) {}
+
       setState(() {
         _unsignSuccess = true;
       });
       _addLog('🚀 Unsigning process completed successfully.');
+
+      if (_outputPath != null) {
+        final historyItem = SignedAppHistoryItem(
+          id: DateTime.now().millisecondsSinceEpoch.toString(),
+          name: extractedMetadata?.name ?? p.basenameWithoutExtension(_outputPath!),
+          packageId: extractedMetadata?.packageId ?? 'Unknown',
+          versionName: extractedMetadata?.versionName ?? '1.0.0',
+          versionCode: extractedMetadata?.versionCode ?? '1',
+          filePath: _outputPath!,
+          platform: _platform,
+          date: DateTime.now().toIso8601String(),
+          isSigned: false,
+        );
+        widget.onUnsignSuccess(historyItem);
+      }
     } catch (e) {
       _addLog('[CRITICAL ERROR] Unsigning failed: $e');
       setState(() {
@@ -3126,14 +3969,17 @@ class _UnsignStudioWidgetState extends State<UnsignStudioWidget> {
   }
 }
 
-// ==========================================
-// 3. PROFILE VAULT TAB WIDGET (DESKTOP)
-// ==========================================
 class VaultWidget extends StatefulWidget {
   final VaultService vaultService;
   final VoidCallback onProfilesChanged;
+  final Function(AppTab) onSelectTab;
 
-  const VaultWidget({super.key, required this.vaultService, required this.onProfilesChanged});
+  const VaultWidget({
+    super.key,
+    required this.vaultService,
+    required this.onProfilesChanged,
+    required this.onSelectTab,
+  });
 
   @override
   State<VaultWidget> createState() => _VaultWidgetState();
@@ -3158,6 +4004,8 @@ class _VaultWidgetState extends State<VaultWidget> {
   final _androidKeyPasswordController = TextEditingController();
   final _androidStorePasswordController = TextEditingController();
   String? _androidKeystorePath;
+  final _androidZipalignController = TextEditingController();
+  final _androidApksignerController = TextEditingController();
 
   @override
   void initState() {
@@ -3185,6 +4033,8 @@ class _VaultWidgetState extends State<VaultWidget> {
     _androidKeyPasswordController.clear();
     _androidStorePasswordController.clear();
     _androidKeystorePath = null;
+    _androidZipalignController.clear();
+    _androidApksignerController.clear();
   }
 
   void _startEdit(SigningProfile? profile) {
@@ -3214,6 +4064,8 @@ class _VaultWidgetState extends State<VaultWidget> {
           _androidKeyAliasController.text = profile.keyAlias;
           _androidKeyPasswordController.text = profile.keyPassword;
           _androidStorePasswordController.text = profile.storePassword;
+          _androidZipalignController.text = profile.zipalignPath;
+          _androidApksignerController.text = profile.apksignerJarPath;
         }
       });
     }
@@ -3262,6 +4114,8 @@ class _VaultWidgetState extends State<VaultWidget> {
         keyAlias: _androidKeyAliasController.text,
         keyPassword: _androidKeyPasswordController.text,
         storePassword: _androidStorePasswordController.text,
+        zipalignPath: _androidZipalignController.text.trim(),
+        apksignerJarPath: _androidApksignerController.text.trim(),
       );
     }
 
@@ -3326,7 +4180,7 @@ class _VaultWidgetState extends State<VaultWidget> {
                               Container(
                                 padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                                 decoration: BoxDecoration(
-                                  color: isIos ? const Color(0xFF8B5CF6).withOpacity(0.15) : const Color(0xFF10B981).withOpacity(0.15),
+                                  color: isIos ? const Color(0xFF8B5CF6).withAlpha(38) : const Color(0xFF10B981).withAlpha(38),
                                   borderRadius: BorderRadius.circular(6),
                                   border: Border.all(color: isIos ? const Color(0xFF8B5CF6) : const Color(0xFF10B981)),
                                 ),
@@ -3562,184 +4416,2064 @@ class _VaultWidgetState extends State<VaultWidget> {
             Expanded(child: _buildInputField(label: 'Keystore Password', controller: _androidStorePasswordController, obscure: true, hint: 'Keystore password')),
           ],
         ),
+        const SizedBox(height: 14),
+        _buildVaultTextFieldWithBrowse(
+          label: 'Zipalign Path',
+          controller: _androidZipalignController,
+          hint: 'Defaults to global command "zipalign"',
+          extensions: [],
+          isAny: true,
+        ),
+        const SizedBox(height: 14),
+        _buildVaultTextFieldWithBrowse(
+          label: 'Apksigner Path',
+          controller: _androidApksignerController,
+          hint: 'Select apksigner.jar file',
+          extensions: ['jar'],
+        ),
       ],
     );
   }
+
+  Widget _buildVaultTextFieldWithBrowse({
+    required String label,
+    required TextEditingController controller,
+    required String hint,
+    required List<String> extensions,
+    bool isAny = false,
+  }) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(label, style: const TextStyle(fontFamily: 'Inter', fontSize: 13, color: Color(0xFFA1A1AA))),
+        const SizedBox(height: 6),
+        Row(
+          children: [
+            Expanded(
+              child: TextField(
+                controller: controller,
+                style: const TextStyle(fontFamily: 'Courier', fontSize: 12, color: Colors.white),
+                decoration: InputDecoration(
+                  hintText: hint,
+                  hintStyle: const TextStyle(color: Color(0xFF52525B)),
+                  fillColor: const Color(0xFF0F0F12),
+                  filled: true,
+                  contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                  enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: const BorderSide(color: Color(0xFF27272A))),
+                  focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: const BorderSide(color: Color(0xFF8B5CF6))),
+                ),
+              ),
+            ),
+            const SizedBox(width: 8),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFF27272A),
+                foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+              ),
+              onPressed: () async {
+                FilePickerResult? result = await FilePicker.platform.pickFiles(
+                  type: isAny ? FileType.any : FileType.custom,
+                  allowedExtensions: isAny ? null : extensions,
+                );
+                if (result != null && result.files.single.path != null) {
+                  setState(() {
+                    controller.text = result.files.single.path!;
+                  });
+                }
+              },
+              child: const Text('Browse', style: TextStyle(fontFamily: 'Inter', fontSize: 13)),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+
 }
 
 // ==========================================
 // 4. SETTINGS TAB WIDGET (DESKTOP)
 // ==========================================
-class SettingsWidget extends StatefulWidget {
-  const SettingsWidget({super.key});
+class AssetOptimizerWidget extends StatefulWidget {
+  const AssetOptimizerWidget({super.key});
 
   @override
-  State<SettingsWidget> createState() => _SettingsWidgetState();
+  State<AssetOptimizerWidget> createState() => _AssetOptimizerWidgetState();
 }
 
-class _SettingsWidgetState extends State<SettingsWidget> {
-  final _zipalignController = TextEditingController();
-  final _apksignerController = TextEditingController();
+class _AssetOptimizerWidgetState extends State<AssetOptimizerWidget> {
+  String? _sourceImagePath;
+  String? _outputDirectoryPath;
+  bool _removeAlpha = true;
+  bool _isProcessing = false;
   
-  final _iosP12Controller = TextEditingController();
-  final _iosProvController = TextEditingController();
-  final _iosP12PasswordController = TextEditingController();
-  final _iosKeychainPasswordController = TextEditingController();
+  String _validationStatus = 'No image selected.';
+  Color _validationColor = const Color(0xFFA1A1AA);
+  bool _isValidImage = false;
+  int? _imageWidth;
+  int? _imageHeight;
+  bool _hasAlphaChannel = false;
+  double? _aspectRatio;
 
-  final _androidKeystoreController = TextEditingController();
-  final _androidKeyAliasController = TextEditingController();
-  final _androidKeyPasswordController = TextEditingController();
-  final _androidStorePasswordController = TextEditingController();
+  final Map<String, bool> _selectedTargets = {
+    'iOS App Store (1024x1024)': true,
+    'iOS iPhone App (180x180)': true,
+    'iOS iPhone App (120x120)': true,
+    'iOS iPad App (152x152)': true,
+    'Android Play Store (512x512)': true,
+    'Android xxxhdpi (192x192)': true,
+    'Android xxhdpi (144x144)': true,
+    'Android xhdpi (96x96)': true,
+    'Android hdpi (72x72)': true,
+  };
 
-  @override
-  void initState() {
-    super.initState();
-    _loadSettings();
-  }
+  final List<String> _consoleLogs = [];
+  final ScrollController _scrollController = ScrollController();
+  final List<Map<String, dynamic>> _generatedAssets = [];
 
-  Future<void> _loadSettings() async {
-    final prefs = await SharedPreferences.getInstance();
+  void _log(String msg) {
     setState(() {
-      _zipalignController.text = prefs.getString('zipalign_path') ?? 'zipalign';
-      _apksignerController.text = prefs.getString('apksigner_path') ?? 'apksigner';
-      _iosP12Controller.text = prefs.getString('ios_p12_path') ?? '';
-      _iosProvController.text = prefs.getString('ios_prov_path') ?? '';
-      _iosP12PasswordController.text = prefs.getString('ios_p12_password') ?? '';
-      _iosKeychainPasswordController.text = prefs.getString('ios_keychain_password') ?? '';
-      _androidKeystoreController.text = prefs.getString('android_keystore_path') ?? '';
-      _androidKeyAliasController.text = prefs.getString('android_key_alias') ?? '';
-      _androidKeyPasswordController.text = prefs.getString('android_key_password') ?? '';
-      _androidStorePasswordController.text = prefs.getString('android_store_password') ?? '';
+      _consoleLogs.add(msg);
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_scrollController.hasClients) {
+        _scrollController.animateTo(
+          _scrollController.position.maxScrollExtent,
+          duration: const Duration(milliseconds: 200),
+          curve: Curves.easeOut,
+        );
+      }
     });
   }
 
-  Future<void> _saveSettings() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('zipalign_path', _zipalignController.text.trim());
-    await prefs.setString('apksigner_path', _apksignerController.text.trim());
-    await prefs.setString('ios_p12_path', _iosP12Controller.text.trim());
-    await prefs.setString('ios_prov_path', _iosProvController.text.trim());
-    await prefs.setString('ios_p12_password', _iosP12PasswordController.text);
-    await prefs.setString('ios_keychain_password', _iosKeychainPasswordController.text);
-    await prefs.setString('android_keystore_path', _androidKeystoreController.text.trim());
-    await prefs.setString('android_key_alias', _androidKeyAliasController.text.trim());
-    await prefs.setString('android_key_password', _androidKeyPasswordController.text);
-    await prefs.setString('android_store_password', _androidStorePasswordController.text);
-
-    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Settings saved successfully!')));
+  Future<void> _pickSourceImage() async {
+    final result = await FilePicker.platform.pickFiles(type: FileType.image);
+    if (result != null && result.files.single.path != null) {
+      final path = result.files.single.path!;
+      _log('📁 Selected source image: ${p.basename(path)}');
+      setState(() {
+        _sourceImagePath = path;
+      });
+      _validateImage(path);
+    }
   }
 
-  Future<void> _pickBinaryPath(TextEditingController controller) async {
-    FilePickerResult? result = await FilePicker.platform.pickFiles(type: FileType.any);
-    if (result != null && result.files.single.path != null) {
+  Future<void> _pickOutputDirectory() async {
+    final path = await FilePicker.platform.getDirectoryPath();
+    if (path != null) {
+      _log('📁 Selected output directory: $path');
       setState(() {
-        controller.text = result.files.single.path!;
+        _outputDirectoryPath = path;
       });
     }
   }
 
-  Future<void> _pickFile(TextEditingController controller, List<String> extensions) async {
-    FilePickerResult? result = await FilePicker.platform.pickFiles(
-      type: FileType.custom,
-      allowedExtensions: extensions,
-    );
-    if (result != null && result.files.single.path != null) {
+  Future<void> _validateImage(String path) async {
+    try {
+      final fileBytes = await File(path).readAsBytes();
+      final original = img.decodeImage(fileBytes);
+      if (original == null) {
+        setState(() {
+          _validationStatus = 'Unsupported or corrupt image format.';
+          _validationColor = const Color(0xFFEF4444);
+          _isValidImage = false;
+        });
+        _log('[ERROR] Failed to decode the image file.');
+        return;
+      }
+      final w = original.width;
+      final h = original.height;
+      final hasAlpha = original.hasAlpha;
+      final ratio = w / h;
+
       setState(() {
-        controller.text = result.files.single.path!;
+        _imageWidth = w;
+        _imageHeight = h;
+        _hasAlphaChannel = hasAlpha;
+        _aspectRatio = ratio;
+        _isValidImage = true;
+      });
+
+      _log('🔎 Image Details: $w x $h pixels, ${hasAlpha ? "RGBA (with transparency)" : "RGB (no transparency)"}');
+
+      List<String> warnings = [];
+      if (w < 1024 || h < 1024) {
+        warnings.add('Resolution is under 1024x1024 (recommended standard). Output icons might be slightly blurry.');
+      }
+      if ((ratio - 1.0).abs() > 0.01) {
+        warnings.add('Image is not square (aspect ratio is ${ratio.toStringAsFixed(2)}:1). Icons will be auto-cropped/centered.');
+      }
+      if (hasAlpha && _removeAlpha) {
+        warnings.add('Image has alpha channel. Transparent background will be replaced with solid black for iOS App Store standard compliance.');
+      }
+
+      if (warnings.isNotEmpty) {
+        final fixList = <String>[];
+        if (w < 1024 || h < 1024) {
+          fixList.add('✔ Resolution: Will upscale output presets to correct sizes (using average interpolation).');
+        }
+        if ((ratio - 1.0).abs() > 0.01) {
+          fixList.add('✔ Aspect Ratio: Will automatically center-crop input to 1:1 square.');
+        }
+        if (hasAlpha && _removeAlpha) {
+          fixList.add('✔ Transparency: Will strip alpha channel and fill background with solid black.');
+        }
+
+        setState(() {
+          _validationStatus = 'Warnings:\n${warnings.map((e) => '• $e').join('\n')}\n\n⚡ Auto-Fix Actions (Applied during Generation):\n${fixList.join('\n')}';
+          _validationColor = const Color(0xFFF59E0B);
+        });
+      } else {
+        setState(() {
+          _validationStatus = 'Image conforms to design guidelines (Perfect square, standard high resolution).';
+          _validationColor = const Color(0xFF10B981);
+        });
+      }
+    } catch (e) {
+      setState(() {
+        _validationStatus = 'Error parsing image: $e';
+        _validationColor = const Color(0xFFEF4444);
+        _isValidImage = false;
+      });
+      _log('[ERROR] Image validation failed: $e');
+    }
+  }
+
+  Future<void> _autoFixSourceImage() async {
+    if (_sourceImagePath == null) return;
+
+    setState(() {
+      _isProcessing = true;
+    });
+
+    _log('⚡ Starting Auto-Fix for Master Image...');
+    try {
+      final bytes = await File(_sourceImagePath!).readAsBytes();
+      final original = img.decodeImage(bytes);
+      if (original == null) {
+        throw Exception('Failed to decode the source image for auto-fixing.');
+      }
+
+      img.Image processed = original;
+
+      // 1. Aspect Ratio Symmetrical Crop from Center
+      final ratio = original.width / original.height;
+      if ((ratio - 1.0).abs() > 0.01) {
+        _log('⚡ Cropping aspect ratio from ${ratio.toStringAsFixed(2)}:1 to 1:1...');
+        final size = original.width < original.height ? original.width : original.height;
+        final x = (original.width - size) ~/ 2;
+        final y = (original.height - size) ~/ 2;
+        processed = img.copyCrop(original, x: x, y: y, width: size, height: size);
+      }
+
+      // 2. Resize to 1024x1024
+      if (processed.width != 1024 || processed.height != 1024) {
+        _log('⚡ Resizing image from ${processed.width}x${processed.height} to 1024x1024...');
+        processed = img.copyResize(processed, width: 1024, height: 1024, interpolation: img.Interpolation.average);
+      }
+
+      // 3. Remove transparency (Alpha channel)
+      if (_removeAlpha && processed.hasAlpha) {
+        _log('⚡ Stripping alpha channel and filling background with solid black...');
+        final background = img.Image(width: 1024, height: 1024);
+        img.fill(background, color: img.ColorRgb8(0, 0, 0));
+        img.compositeImage(background, processed);
+        processed = background;
+      }
+
+      // Save fixed image
+      final dir = p.dirname(_sourceImagePath!);
+      final filename = p.basenameWithoutExtension(_sourceImagePath!);
+      final fixedPath = p.join(dir, '${filename}_fixed_1024.png');
+
+      final encoded = img.encodePng(processed);
+      await File(fixedPath).writeAsBytes(encoded);
+
+      _log('✅ Auto-Fix complete! Saved fixed image: $fixedPath');
+
+      setState(() {
+        _sourceImagePath = fixedPath;
+      });
+
+      await _validateImage(fixedPath);
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Master image successfully optimized to 1024x1024 square with no transparency!'),
+            backgroundColor: Color(0xFF10B981),
+          ),
+        );
+      }
+    } catch (e) {
+      _log('[ERROR] Failed to auto-fix master image: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Failed to auto-fix master image: $e'),
+            backgroundColor: const Color(0xFFEF4444),
+          ),
+        );
+      }
+    } finally {
+      setState(() {
+        _isProcessing = false;
       });
     }
+  }
+
+  void _openDirectoryInFinder(String dirPath) {
+    if (Platform.isMacOS) {
+      Process.run('open', [dirPath]);
+    } else if (Platform.isWindows) {
+      Process.run('explorer.exe', [dirPath]);
+    }
+  }
+
+  Future<void> _optimizeAndGenerate() async {
+    if (_sourceImagePath == null) return;
+    final outDir = _outputDirectoryPath ?? p.dirname(_sourceImagePath!);
+    final parentFolder = Directory(p.join(outDir, 'AppIcons'));
+    final iosFolder = Directory(p.join(parentFolder.path, 'ios'));
+    final androidFolder = Directory(p.join(parentFolder.path, 'android'));
+
+    setState(() {
+      _isProcessing = true;
+      _generatedAssets.clear();
+      _consoleLogs.clear();
+    });
+
+    _log('🚀 Initializing Asset Optimizer...');
+    _log('📂 Source: $_sourceImagePath');
+    _log('📂 Parent folder: ${parentFolder.path}');
+
+    try {
+      // Create directories recursively
+      await parentFolder.create(recursive: true);
+      await iosFolder.create(recursive: true);
+      await androidFolder.create(recursive: true);
+      _log('📁 Created output subfolders: ios/ and android/');
+
+      final bytes = await File(_sourceImagePath!).readAsBytes();
+      final original = img.decodeImage(bytes);
+      if (original == null) {
+        throw Exception('Failed to decode the source image.');
+      }
+      _log('✅ Loaded master image: ${original.width}x${original.height}');
+
+      final List<Map<String, dynamic>> targets = [
+        {'name': 'iOS App Store (1024x1024)', 'width': 1024, 'height': 1024, 'file': 'appicon_1024.png', 'platform': 'ios'},
+        {'name': 'iOS iPhone App (180x180)', 'width': 180, 'height': 180, 'file': 'appicon_180.png', 'platform': 'ios'},
+        {'name': 'iOS iPhone App (120x120)', 'width': 120, 'height': 120, 'file': 'appicon_120.png', 'platform': 'ios'},
+        {'name': 'iOS iPad App (152x152)', 'width': 152, 'height': 152, 'file': 'appicon_152.png', 'platform': 'ios'},
+        {'name': 'Android Play Store (512x512)', 'width': 512, 'height': 512, 'file': 'ic_launcher_play_store.png', 'platform': 'android'},
+        {'name': 'Android xxxhdpi (192x192)', 'width': 192, 'height': 192, 'file': 'ic_launcher_192.png', 'platform': 'android'},
+        {'name': 'Android xxhdpi (144x144)', 'width': 144, 'height': 144, 'file': 'ic_launcher_144.png', 'platform': 'android'},
+        {'name': 'Android xhdpi (96x96)', 'width': 96, 'height': 96, 'file': 'ic_launcher_96.png', 'platform': 'android'},
+        {'name': 'Android hdpi (72x72)', 'width': 72, 'height': 72, 'file': 'ic_launcher_72.png', 'platform': 'android'},
+      ];
+
+      for (final t in targets) {
+        final key = t['name'] as String;
+        if (_selectedTargets[key] != true) {
+          _log('⏭️ Skipping $key as it is unchecked.');
+          continue;
+        }
+
+        final w = t['width'] as int;
+        final h = t['height'] as int;
+        final filename = t['file'] as String;
+        final isIos = t['platform'] == 'ios';
+        final targetDir = isIos ? iosFolder : androidFolder;
+        final outputPath = p.join(targetDir.path, filename);
+
+        _log('⚡ Processing $key ($w x $h)...');
+
+        img.Image processed = original;
+        if ((original.width - original.height).abs() > 2) {
+          final size = original.width < original.height ? original.width : original.height;
+          final x = (original.width - size) ~/ 2;
+          final y = (original.height - size) ~/ 2;
+          processed = img.copyCrop(original, x: x, y: y, width: size, height: size);
+        }
+
+        final resized = img.copyResize(processed, width: w, height: h, interpolation: img.Interpolation.average);
+
+        img.Image finalImage = resized;
+        if (_removeAlpha && finalImage.hasAlpha) {
+          final background = img.Image(width: w, height: h);
+          img.fill(background, color: img.ColorRgb8(0, 0, 0));
+          img.compositeImage(background, finalImage);
+          finalImage = background;
+        }
+
+        final encoded = img.encodePng(finalImage);
+        final file = File(outputPath);
+        await file.writeAsBytes(encoded);
+
+        final sizeKb = (encoded.length / 1024).toStringAsFixed(1);
+        final relativePath = '${isIos ? "ios" : "android"}/$filename';
+        _log('💾 Generated $relativePath ($sizeKb KB)');
+
+        setState(() {
+          _generatedAssets.add({
+            'name': relativePath,
+            'size': '$sizeKb KB',
+            'path': outputPath,
+            'width': w,
+            'height': h,
+          });
+        });
+      }
+
+      _log('🎉 All assets optimized and written successfully!');
+    } catch (e) {
+      _log('[CRITICAL ERROR] Optimization failed: $e');
+    } finally {
+      setState(() {
+        _isProcessing = false;
+      });
+    }
+  }
+
+  void _showInFinder(String filePath) {
+    verifyAndLocateFile(context, filePath);
   }
 
   @override
   Widget build(BuildContext context) {
     return Container(
       padding: const EdgeInsets.all(24),
-      decoration: BoxDecoration(color: const Color(0xFF1E1E22), borderRadius: BorderRadius.circular(16), border: Border.all(color: const Color(0xFF27272A))),
-      child: SingleChildScrollView(
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text('iOS Certificate & Profile Settings', style: TextStyle(fontFamily: 'Inter', fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white)),
-            const SizedBox(height: 6),
-            const Text('Configure the default P12 certificate file, provisioning profile, and passwords to use for iOS signing. These are kept securely on your local machine.', style: TextStyle(fontFamily: 'Inter', fontSize: 12, color: Color(0xFF71717A))),
-            const SizedBox(height: 24),
-            _buildIosFilePickerField(label: 'P12 Certificate (.p12) Path', controller: _iosP12Controller, hint: 'Select default .p12 certificate', extensions: ['p12']),
-            const SizedBox(height: 16),
-            _buildIosFilePickerField(label: 'Provisioning Profile (.mobileprovision) Path', controller: _iosProvController, hint: 'Select default .mobileprovision profile', extensions: ['mobileprovision']),
-            const SizedBox(height: 16),
-            Row(
+      decoration: BoxDecoration(
+        color: const Color(0xFF1E1E22),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: const Color(0xFF27272A)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Left Column
+          Expanded(
+            flex: 5,
+            child: SingleChildScrollView(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Optimizer Source & Config',
+                    style: TextStyle(fontFamily: 'Inter', fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white),
+                  ),
+                  const SizedBox(height: 16),
+                  
+                  // Master Image Picker
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text('Master App Icon File', style: TextStyle(fontFamily: 'Inter', fontSize: 13, color: Color(0xFFA1A1AA))),
+                      const SizedBox(height: 6),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                              decoration: BoxDecoration(
+                                color: const Color(0xFF0F0F12),
+                                borderRadius: BorderRadius.circular(8),
+                                border: Border.all(color: const Color(0xFF27272A)),
+                              ),
+                              child: Text(
+                                _sourceImagePath != null ? p.basename(_sourceImagePath!) : 'Select high-res master icon (recommended 1024x1024)',
+                                style: TextStyle(
+                                  fontFamily: 'Inter',
+                                  fontSize: 13,
+                                  color: _sourceImagePath != null ? Colors.white : const Color(0xFF52525B),
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          ElevatedButton(
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: const Color(0xFF27272A),
+                              foregroundColor: Colors.white,
+                              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
+                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                            ),
+                            onPressed: _pickSourceImage,
+                            child: const Text('Browse', style: TextStyle(fontFamily: 'Inter', fontSize: 13)),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                  
+                  const SizedBox(height: 16),
+                  
+                  // Output Directory Picker
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text('Output Directory (Optional)', style: TextStyle(fontFamily: 'Inter', fontSize: 13, color: Color(0xFFA1A1AA))),
+                      const SizedBox(height: 6),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                              decoration: BoxDecoration(
+                                color: const Color(0xFF0F0F12),
+                                borderRadius: BorderRadius.circular(8),
+                                border: Border.all(color: const Color(0xFF27272A)),
+                              ),
+                              child: Text(
+                                _outputDirectoryPath != null ? _outputDirectoryPath! : 'Defaults to source image folder',
+                                style: TextStyle(
+                                  fontFamily: 'Inter',
+                                  fontSize: 13,
+                                  color: _outputDirectoryPath != null ? Colors.white : const Color(0xFF52525B),
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          ElevatedButton(
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: const Color(0xFF27272A),
+                              foregroundColor: Colors.white,
+                              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
+                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                            ),
+                            onPressed: _pickOutputDirectory,
+                            child: const Text('Browse', style: TextStyle(fontFamily: 'Inter', fontSize: 13)),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                  
+                  const SizedBox(height: 20),
+                  
+                  // Optimization Options
+                  Row(
+                    children: [
+                      Checkbox(
+                        value: _removeAlpha,
+                        activeColor: const Color(0xFF8B5CF6),
+                        onChanged: (val) {
+                          setState(() {
+                            _removeAlpha = val ?? true;
+                          });
+                          if (_sourceImagePath != null) {
+                            _validateImage(_sourceImagePath!);
+                          }
+                        },
+                      ),
+                      const Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              'Remove transparency (Alpha channel)',
+                              style: TextStyle(fontFamily: 'Inter', fontSize: 13, fontWeight: FontWeight.bold, color: Colors.white),
+                            ),
+                            Text(
+                              'Converts transparent backgrounds to solid black. Required for iOS App Store standard app icons.',
+                              style: TextStyle(fontFamily: 'Inter', fontSize: 11, color: Color(0xFF71717A)),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                  
+                  const SizedBox(height: 24),
+                  const Divider(color: Color(0xFF27272A)),
+                  const SizedBox(height: 16),
+                  
+                  // Preset Checklist Title
+                  const Text(
+                    'Target Resize Presets',
+                    style: TextStyle(fontFamily: 'Inter', fontSize: 14, fontWeight: FontWeight.bold, color: Colors.white),
+                  ),
+                  const SizedBox(height: 12),
+                  
+                  // List of Presets
+                  ..._selectedTargets.keys.map((key) {
+                    return Row(
+                      children: [
+                        Checkbox(
+                          value: _selectedTargets[key],
+                          activeColor: const Color(0xFF8B5CF6),
+                          onChanged: (val) {
+                            setState(() {
+                              _selectedTargets[key] = val ?? false;
+                            });
+                          },
+                        ),
+                        Text(
+                          key,
+                          style: const TextStyle(fontFamily: 'Courier', fontSize: 12, color: Colors.white70),
+                        ),
+                      ],
+                    );
+                  }),
+                  
+                  const SizedBox(height: 32),
+                  
+                  // Run Button
+                  Container(
+                    width: double.infinity,
+                    height: 52,
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        colors: (_isProcessing || _sourceImagePath == null)
+                            ? [const Color(0xFF3F3F46), const Color(0xFF27272A)]
+                            : [const Color(0xFF8B5CF6), const Color(0xFF6D28D9)],
+                      ),
+                      borderRadius: BorderRadius.circular(12),
+                      boxShadow: [
+                        if (!_isProcessing && _sourceImagePath != null)
+                          BoxShadow(color: const Color(0xFF8B5CF6).withOpacity(0.3), blurRadius: 12, offset: const Offset(0, 4)),
+                      ],
+                    ),
+                    child: ElevatedButton(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.transparent,
+                        foregroundColor: Colors.white,
+                        shadowColor: Colors.transparent,
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                      ),
+                      onPressed: (_isProcessing || _sourceImagePath == null) ? null : _optimizeAndGenerate,
+                      child: _isProcessing
+                          ? const Row(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white)),
+                                SizedBox(width: 12),
+                                Text('OPTIMIZING ASSETS...', style: TextStyle(fontFamily: 'Inter', fontWeight: FontWeight.bold, fontSize: 15)),
+                              ],
+                            )
+                          : const Row(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                Icon(Icons.flash_on_rounded, size: 20),
+                                SizedBox(width: 8),
+                                Text('Optimize & Generate App Icons Now', style: TextStyle(fontFamily: 'Inter', fontWeight: FontWeight.bold, fontSize: 15)),
+                              ],
+                            ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          
+          const SizedBox(width: 24),
+          
+          // Right Column
+          Expanded(
+            flex: 4,
+            child: Column(
               children: [
-                Expanded(
-                  child: _buildSettingsInputField(label: 'P12 Password', controller: _iosP12PasswordController, hint: 'P12 password', obscure: true),
+                // Validation Guidance Card
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF0F0F12),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: const Color(0xFF27272A)),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Row(
+                        children: [
+                          Icon(Icons.info_outline_rounded, color: Color(0xFF8B5CF6), size: 18),
+                          SizedBox(width: 8),
+                          Text('GUIDELINE COMPLIANCE SCANNER', style: TextStyle(fontFamily: 'Inter', fontSize: 12, fontWeight: FontWeight.bold, color: Color(0xFF8B5CF6))),
+                        ],
+                      ),
+                      const SizedBox(height: 12),
+                      Text(
+                        _validationStatus,
+                        style: TextStyle(fontFamily: 'Inter', fontSize: 12, height: 1.4, color: _validationColor),
+                      ),
+                      if (_sourceImagePath != null && _validationColor == const Color(0xFFF59E0B)) ...[
+                        const SizedBox(height: 16),
+                        SizedBox(
+                          width: double.infinity,
+                          child: ElevatedButton.icon(
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: const Color(0xFFF59E0B).withAlpha(38),
+                              foregroundColor: const Color(0xFFF59E0B),
+                              side: const BorderSide(color: Color(0xFFF59E0B), width: 1),
+                              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                            ),
+                            icon: const Icon(Icons.auto_fix_high_rounded, size: 16),
+                            label: const Text(
+                              'Auto-Fix Master Image',
+                              style: TextStyle(fontFamily: 'Inter', fontSize: 12, fontWeight: FontWeight.bold),
+                            ),
+                            onPressed: _autoFixSourceImage,
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
                 ),
-                const SizedBox(width: 16),
+                
+                const SizedBox(height: 16),
+                
+                // Console Output
+                Container(
+                  width: double.infinity,
+                  height: 220,
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF0A0A0C),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: const Color(0xFF27272A)),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Row(
+                        children: [
+                          Icon(Icons.terminal, color: Color(0xFF10B981), size: 16),
+                          SizedBox(width: 8),
+                          Text('PROCESS OUTPUT LOGGER', style: TextStyle(fontFamily: 'Courier', fontSize: 11, fontWeight: FontWeight.bold, color: Color(0xFF10B981))),
+                        ],
+                      ),
+                      const Divider(color: Color(0xFF27272A)),
+                      Expanded(
+                        child: SelectionArea(
+                          child: _consoleLogs.isEmpty
+                              ? Center(
+                                  child: Text(
+                                    'Load image and tap Optimize to view output.',
+                                    style: TextStyle(fontFamily: 'Courier', fontSize: 12, color: Colors.grey[700]),
+                                  ),
+                                )
+                              : ListView.builder(
+                                  controller: _scrollController,
+                                  itemCount: _consoleLogs.length,
+                                  itemBuilder: (context, index) {
+                                    final line = _consoleLogs[index];
+                                    Color color = Colors.white70;
+                                    if (line.startsWith('[ERROR]') || line.startsWith('[CRITICAL ERROR]')) {
+                                      color = const Color(0xFFEF4444);
+                                    } else if (line.startsWith('🎉') || line.startsWith('✅')) {
+                                      color = const Color(0xFF10B981);
+                                    } else if (line.startsWith('⚡') || line.startsWith('🚀')) {
+                                      color = const Color(0xFF8B5CF6);
+                                    }
+                                    return Text(
+                                      line,
+                                      style: TextStyle(fontFamily: 'Courier', fontSize: 11, color: color),
+                                    );
+                                  },
+                                ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                
+                const SizedBox(height: 16),
+                
+                // Generated Assets List
                 Expanded(
-                  child: _buildSettingsInputField(label: 'Keychain Password', controller: _iosKeychainPasswordController, hint: 'Unlock Mac login keychain', obscure: true),
+                  child: Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(16),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF131317),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: const Color(0xFF27272A)),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            const Text(
+                              'GENERATED APP ASSETS',
+                              style: TextStyle(fontFamily: 'Inter', fontSize: 12, fontWeight: FontWeight.bold, color: Colors.white70),
+                            ),
+                            if (_generatedAssets.isNotEmpty)
+                              TextButton.icon(
+                                style: TextButton.styleFrom(
+                                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                                  minimumSize: Size.zero,
+                                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                                ),
+                                icon: const Icon(Icons.folder_open_rounded, size: 14, color: Color(0xFF8B5CF6)),
+                                label: const Text('Open AppIcons Folder', style: TextStyle(fontFamily: 'Inter', fontSize: 11, color: Color(0xFF8B5CF6))),
+                                onPressed: () {
+                                  final outDir = _outputDirectoryPath ?? p.dirname(_sourceImagePath!);
+                                  final parentFolderPath = p.join(outDir, 'AppIcons');
+                                  _openDirectoryInFinder(parentFolderPath);
+                                },
+                              ),
+                          ],
+                        ),
+                        const Divider(color: Color(0xFF27272A)),
+                        Expanded(
+                          child: _generatedAssets.isEmpty
+                              ? Center(
+                                  child: Text(
+                                    'No assets generated yet.',
+                                    style: TextStyle(fontFamily: 'Inter', fontSize: 12, color: Colors.grey[600]),
+                                  ),
+                                )
+                              : ListView.builder(
+                                  itemCount: _generatedAssets.length,
+                                  itemBuilder: (context, index) {
+                                    final asset = _generatedAssets[index];
+                                    return Container(
+                                      margin: const EdgeInsets.only(bottom: 8),
+                                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                                      decoration: BoxDecoration(
+                                        color: const Color(0xFF1E1E22),
+                                        borderRadius: BorderRadius.circular(8),
+                                        border: Border.all(color: const Color(0xFF27272A)),
+                                      ),
+                                      child: Row(
+                                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                        children: [
+                                          Expanded(
+                                            child: Column(
+                                              crossAxisAlignment: CrossAxisAlignment.start,
+                                              children: [
+                                                Text(
+                                                  asset['name'] as String,
+                                                  style: const TextStyle(fontFamily: 'Courier', fontSize: 12, fontWeight: FontWeight.bold, color: Colors.white),
+                                                  overflow: TextOverflow.ellipsis,
+                                                ),
+                                                const SizedBox(height: 4),
+                                                Text(
+                                                  '${asset["width"]}x${asset["height"]} • ${asset["size"]}',
+                                                  style: TextStyle(fontFamily: 'Inter', fontSize: 10, color: Colors.grey[500]),
+                                                ),
+                                              ],
+                                            ),
+                                          ),
+                                          IconButton(
+                                            icon: const Icon(Icons.folder_open_rounded, size: 16, color: Color(0xFF8B5CF6)),
+                                            onPressed: () => _showInFinder(asset['path'] as String),
+                                            tooltip: 'Show in Finder',
+                                          ),
+                                        ],
+                                      ),
+                                    );
+                                  },
+                                ),
+                        ),
+                      ],
+                    ),
+                  ),
                 ),
               ],
             ),
+          ),
+        ],
+      ),
+    );
+  }
+}
 
-            const Divider(color: Color(0xFF27272A), height: 40),
-            
-            const Text('Android Keystore & Tool Defaults', style: TextStyle(fontFamily: 'Inter', fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white)),
-            const SizedBox(height: 6),
-            const Text('Configure the default keystore file, credentials, and binary tool paths for Android APK/AAB signing.', style: TextStyle(fontFamily: 'Inter', fontSize: 12, color: Color(0xFF71717A))),
-            const SizedBox(height: 24),
-            _buildIosFilePickerField(label: 'Keystore (.jks/.keystore/.pfx) Path', controller: _androidKeystoreController, hint: 'Select default keystore file', extensions: ['keystore', 'jks', 'pfx']),
-            const SizedBox(height: 16),
-            _buildSettingsInputField(label: 'Key Alias', controller: _androidKeyAliasController, hint: 'Default key alias'),
-            const SizedBox(height: 16),
-            Row(
-              children: [
-                Expanded(
-                  child: _buildSettingsInputField(label: 'Key Password', controller: _androidKeyPasswordController, hint: 'Key password', obscure: true),
-                ),
-                const SizedBox(width: 16),
-                Expanded(
-                  child: _buildSettingsInputField(label: 'Keystore Password', controller: _androidStorePasswordController, hint: 'Keystore store password', obscure: true),
-                ),
-              ],
-            ),
-            const SizedBox(height: 24),
-            const Text('Signing Utility Path Overrides (Optional)', style: TextStyle(fontFamily: 'Inter', fontSize: 13, fontWeight: FontWeight.bold, color: Color(0xFFA1A1AA))),
-            const SizedBox(height: 12),
-            _buildBinaryPathField(label: 'Zipalign Path', controller: _zipalignController, hint: 'Defaults to global command "zipalign"'),
-            const SizedBox(height: 16),
-            _buildIosFilePickerField(label: 'Apksigner Path', controller: _apksignerController, hint: 'Select apksigner.jar file', extensions: ['jar']),
-            
-            const SizedBox(height: 32),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.end,
-              children: [
-                ElevatedButton(
-                  style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF8B5CF6), foregroundColor: Colors.white, padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8))),
-                  onPressed: _saveSettings,
-                  child: const Text('Save Settings', style: TextStyle(fontFamily: 'Inter', fontSize: 13, fontWeight: FontWeight.bold)),
-                ),
-              ],
+// =============================================================================
+// DEVOPS WORKSPACE & AI ACTIVITY REPORTER WIDGET
+// =============================================================================
+class DevOpsWorkItem {
+  final String id;
+  final String title;
+  final String status;
+  final String type;
+  final String date;
+  final String month;
+  final DateTime dateTime;
+
+  DevOpsWorkItem({
+    required this.id,
+    required this.title,
+    required this.status,
+    required this.type,
+    required this.date,
+    required this.month,
+    required this.dateTime,
+  });
+}
+
+class DevOpsPullRequest {
+  final String id;
+  final String title;
+  final String status;
+  final String repo;
+  final String sourceBranch;
+  final String targetBranch;
+  final String date;
+  final String month;
+  final DateTime dateTime;
+
+  DevOpsPullRequest({
+    required this.id,
+    required this.title,
+    required this.status,
+    required this.repo,
+    required this.sourceBranch,
+    required this.targetBranch,
+    required this.date,
+    required this.month,
+    required this.dateTime,
+  });
+}
+
+class DevOpsWidget extends StatefulWidget {
+  const DevOpsWidget({super.key});
+
+  @override
+  State<DevOpsWidget> createState() => _DevOpsWidgetState();
+}
+
+class _DevOpsWidgetState extends State<DevOpsWidget> with SingleTickerProviderStateMixin {
+  bool _isConnected = false;
+  bool _isLoading = false;
+  String? _errorMessage;
+
+  String _org = '';
+  String _project = '';
+  String _pat = '';
+  String _email = '';
+
+  final _orgController = TextEditingController();
+  final _projectController = TextEditingController();
+  final _patController = TextEditingController();
+  final _emailController = TextEditingController();
+
+  List<DevOpsWorkItem> _workItems = [];
+  List<DevOpsPullRequest> _prs = [];
+
+  List<double> _weeklyActivity = [3, 2, 4, 1, 3];
+  
+  late AnimationController _chartAnimationController;
+  late Animation<double> _chartAnimation;
+
+  String? _aiStandupText;
+  bool _generatingStandup = false;
+
+  Timer? _notificationTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    _chartAnimationController = AnimationController(
+      duration: const Duration(milliseconds: 1500),
+      vsync: this,
+    );
+    _chartAnimation = Tween<double>(begin: 0, end: 1).animate(
+      CurvedAnimation(parent: _chartAnimationController, curve: Curves.easeOutBack),
+    );
+    _loadSavedCredentials();
+    _setupNotifications();
+  }
+
+  @override
+  void dispose() {
+    _chartAnimationController.dispose();
+    _notificationTimer?.cancel();
+    super.dispose();
+  }
+
+  void _setupNotifications() {
+    _notificationTimer = Timer.periodic(const Duration(seconds: 35), (timer) {
+      if (!mounted || !_isConnected) return;
+      _triggerRealtimeAlert();
+    });
+  }
+
+  void _triggerRealtimeAlert() {
+    final alerts = [
+      {'title': 'Updated Android Keystore default paths', 'branch': 'feature/keystore-defaults', 'status': 'Approved'},
+      {'title': 'Fixed iOS mobileprovision parse error', 'branch': 'bugfix/provision-mismatch', 'status': 'Completed'},
+      {'title': 'Optimized QR Code isolate decoding', 'branch': 'feature/qr-optimization', 'status': 'Active'},
+    ];
+    final alert = (alerts..shuffle()).first;
+    
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Row(
+          children: [
+            const Icon(Icons.alt_route, color: Color(0xFF8B5CF6), size: 16),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                'DevOps Alert: "${alert['title']}" in branch "${alert['branch']}" is now ${alert['status']}!',
+                style: const TextStyle(fontFamily: 'Inter', fontSize: 12, color: Colors.white),
+              ),
             ),
           ],
         ),
+        backgroundColor: const Color(0xFF1E1E24),
+        behavior: SnackBarBehavior.floating,
+        duration: const Duration(seconds: 5),
+        margin: const EdgeInsets.all(20),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
       ),
     );
   }
 
-  Widget _buildSettingsInputField({required String label, required TextEditingController controller, required String hint, bool obscure = false}) {
+  Future<void> _loadSavedCredentials() async {
+    final prefs = await SharedPreferences.getInstance();
+    setState(() {
+      _org = prefs.getString('ado_org') ?? '';
+      _project = prefs.getString('ado_project') ?? '';
+      _pat = prefs.getString('ado_pat') ?? '';
+      _email = prefs.getString('ado_email') ?? '';
+
+      _orgController.text = _org;
+      _projectController.text = _project;
+      _patController.text = _pat;
+      _emailController.text = _email;
+    });
+
+    if (_org.isNotEmpty && _project.isNotEmpty && _pat.isNotEmpty) {
+      _syncDevOps();
+    } else {
+      _loadMockData();
+    }
+  }
+
+  Future<void> _saveCredentials() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('ado_org', _orgController.text.trim());
+    await prefs.setString('ado_project', _projectController.text.trim());
+    await prefs.setString('ado_pat', _patController.text.trim());
+    await prefs.setString('ado_email', _emailController.text.trim());
+
+    setState(() {
+      _org = _orgController.text.trim();
+      _project = _projectController.text.trim();
+      _pat = _patController.text.trim();
+      _email = _emailController.text.trim();
+    });
+
+    Navigator.of(context).pop();
+    _syncDevOps();
+  }
+
+  void _loadMockData() {
+    final now = DateTime.now();
+    setState(() {
+      _isConnected = true;
+      _workItems = [
+        DevOpsWorkItem(
+          id: '10432',
+          title: 'Secure credentials storage validation and encryption checks',
+          status: 'Dev Done',
+          type: 'Bug',
+          date: '${now.day - 1} Jun',
+          month: 'Jun 2026',
+          dateTime: now.subtract(const Duration(days: 1)),
+        ),
+        DevOpsWorkItem(
+          id: '10435',
+          title: 'Implement drag & drop to strip Apple digital signature',
+          status: 'In Progress',
+          type: 'Task',
+          date: '${now.day} Jun',
+          month: 'Jun 2026',
+          dateTime: now,
+        ),
+        DevOpsWorkItem(
+          id: '10389',
+          title: 'Integrate zipalign and apksigner path inputs in Profile Vault',
+          status: 'Resolved',
+          type: 'Task',
+          date: '28 May',
+          month: 'May 2026',
+          dateTime: now.subtract(const Duration(days: 6)),
+        ),
+        DevOpsWorkItem(
+          id: '10440',
+          title: 'Fix QR code image parsing isolate crash on older macOS builds',
+          status: 'To Do',
+          type: 'Bug',
+          date: '${now.day + 1} Jun',
+          month: 'Jun 2026',
+          dateTime: now.add(const Duration(days: 1)),
+        ),
+      ];
+
+      _prs = [
+        DevOpsPullRequest(
+          id: '2024',
+          title: 'Integrate zipalign & apksigner keystore fields',
+          status: 'Completed',
+          repo: 'sign-studio-app',
+          sourceBranch: 'feature/vault-keystore-paths',
+          targetBranch: 'main',
+          date: '28 May',
+          month: 'May 2026',
+          dateTime: now.subtract(const Duration(days: 6)),
+        ),
+        DevOpsPullRequest(
+          id: '2027',
+          title: 'Implement drag-drop signature stripping logic',
+          status: 'Active',
+          repo: 'sign-studio-app',
+          sourceBranch: 'feature/drag-drop-strip',
+          targetBranch: 'dev',
+          date: '${now.day} Jun',
+          month: 'Jun 2026',
+          dateTime: now,
+        ),
+      ];
+      _weeklyActivity = [3, 2, 4, 1, 3];
+    });
+
+    _chartAnimationController.reset();
+    _chartAnimationController.forward();
+  }
+
+  Future<void> _syncDevOps() async {
+    if (_org.isEmpty || _project.isEmpty || _pat.isEmpty) {
+      _loadMockData();
+      return;
+    }
+
+    setState(() {
+      _isLoading = true;
+      _errorMessage = null;
+    });
+
+    try {
+      final credentials = base64Encode(utf8.encode(':$_pat'));
+      final headers = {
+        'Authorization': 'Basic $credentials',
+        'Content-Type': 'application/json',
+      };
+
+      final encodedOrg = Uri.encodeComponent(_org);
+      final encodedProject = Uri.encodeComponent(_project);
+
+      final wiqlUrl = Uri.parse('https://dev.azure.com/$encodedOrg/$encodedProject/_apis/wit/wiql?api-version=7.0');
+      final queryBody = {
+        "query": "Select [System.Id] From WorkItems Where [System.TeamProject] = @project And ([System.AssignedTo] = @me${_email.isNotEmpty ? " Or [System.AssignedTo] = '$_email'" : ""})"
+      };
+
+      final wiqlResponse = await http.post(wiqlUrl, headers: headers, body: json.encode(queryBody));
+      if (wiqlResponse.statusCode != 200) {
+        throw Exception('API error code ${wiqlResponse.statusCode}');
+      }
+
+      final wiqlData = json.decode(wiqlResponse.body);
+      final List<dynamic> wiJson = wiqlData['workItems'] ?? [];
+      final List<DevOpsWorkItem> items = [];
+
+      if (wiJson.isNotEmpty) {
+        final ids = wiJson.map((wi) => wi['id']).take(20).join(',');
+        final detailsUrl = Uri.parse('https://dev.azure.com/$encodedOrg/$encodedProject/_apis/wit/workitems?ids=$ids&api-version=7.0');
+        final detailsResponse = await http.get(detailsUrl, headers: headers);
+
+        if (detailsResponse.statusCode == 200) {
+          final detailsData = json.decode(detailsResponse.body);
+          final List<dynamic> values = detailsData['value'] ?? [];
+          for (final val in values) {
+            final fields = val['fields'] ?? {};
+            final title = fields['System.Title'] ?? 'Untitled';
+            final state = fields['System.State'] ?? 'To Do';
+            final type = fields['System.WorkItemType'] ?? 'Task';
+            final changedDateStr = fields['System.ChangedDate'] ?? '';
+
+            DateTime changedDate = DateTime.now();
+            if (changedDateStr.isNotEmpty) {
+              changedDate = DateTime.parse(changedDateStr).toLocal();
+            }
+
+            final List<String> months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+            final month = '${months[changedDate.month - 1]} ${changedDate.year}';
+            final date = '${changedDate.day} ${months[changedDate.month - 1]}';
+
+            items.add(DevOpsWorkItem(
+              id: val['id'].toString(),
+              title: title,
+              status: state,
+              type: type,
+              date: date,
+              month: month,
+              dateTime: changedDate,
+            ));
+          }
+        }
+      }
+
+      final prUrl = Uri.parse('https://dev.azure.com/$encodedOrg/$encodedProject/_apis/git/pullrequests?searchCriteria.status=all&%24top=20&api-version=7.0');
+      final prResponse = await http.get(prUrl, headers: headers);
+      final List<DevOpsPullRequest> prs = [];
+
+      if (prResponse.statusCode == 200) {
+        final prData = json.decode(prResponse.body);
+        final List<dynamic> values = prData['value'] ?? [];
+        for (final val in values) {
+          final title = val['title'] ?? 'No Title';
+          String status = val['status'] ?? 'active';
+          if (status.toLowerCase() == 'active') {
+            status = 'Active';
+          } else if (status.toLowerCase() == 'completed' || status.toLowerCase() == 'merged') {
+            status = 'Completed';
+          } else if (status.toLowerCase() == 'abandoned') {
+            status = 'Abandoned';
+          }
+          final sourceRef = val['sourceRefName'] ?? '';
+          final targetRef = val['targetRefName'] ?? '';
+          final creationDateStr = val['creationDate'] ?? '';
+          final repo = val['repository']?['name'] ?? 'Repo';
+
+          final sourceBranch = sourceRef.replaceAll('refs/heads/', '');
+          final targetBranch = targetRef.replaceAll('refs/heads/', '');
+
+          DateTime creationDate = DateTime.now();
+          if (creationDateStr.isNotEmpty) {
+            creationDate = DateTime.parse(creationDateStr).toLocal();
+          }
+
+          final List<String> months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+          final month = '${months[creationDate.month - 1]} ${creationDate.year}';
+          final date = '${creationDate.day} ${months[creationDate.month - 1]}';
+
+          prs.add(DevOpsPullRequest(
+            id: val['pullRequestId'].toString(),
+            title: title,
+            status: status,
+            repo: repo,
+            sourceBranch: sourceBranch,
+            targetBranch: targetBranch,
+            date: date,
+            month: month,
+            dateTime: creationDate,
+          ));
+        }
+      }
+
+      List<double> weeklyCounts = [0, 0, 0, 0, 0];
+      final now = DateTime.now();
+      final monday = now.subtract(Duration(days: now.weekday - 1));
+      for (final item in items) {
+        if (item.dateTime.isAfter(monday) && item.dateTime.isBefore(now.add(const Duration(days: 1)))) {
+          final dayIndex = item.dateTime.weekday - 1;
+          if (dayIndex >= 0 && dayIndex < 5) {
+            weeklyCounts[dayIndex]++;
+          }
+        }
+      }
+
+      setState(() {
+        _workItems = items;
+        _prs = prs;
+        if (weeklyCounts.any((c) => c > 0)) {
+          _weeklyActivity = weeklyCounts;
+        }
+        _isLoading = false;
+        _isConnected = true;
+      });
+
+      _chartAnimationController.reset();
+      _chartAnimationController.forward();
+
+    } catch (e) {
+      setState(() {
+        _errorMessage = 'Failed to fetch from Azure DevOps REST API: $e. Loaded mock datasets.';
+        _isLoading = false;
+      });
+      _loadMockData();
+    }
+  }
+
+  void _showWorkItemDetails(DevOpsWorkItem item) {
+    String description = '';
+    if (item.title.contains('Secure credentials storage')) {
+      description = 'Review current KeyStore/KeyChain security procedures. Ensure AES-256-GCM keys are validated, cryptographically sound, and credentials are encrypted before persistence.';
+    } else if (item.title.contains('drag & drop') || item.title.contains('drag-drop')) {
+      description = 'Integrate drag-and-drop layer to receive visual files and strip Apple signatures. Remove the _CodeSignature directory and check the file integrity before signing.';
+    } else if (item.title.contains('zipalign')) {
+      description = 'Enable user to customize paths for zipalign and apksigner binaries inside the Profile Vault. Automatically verify selected binary paths are executable.';
+    } else if (item.title.contains('QR code') || item.title.contains('QR-code')) {
+      description = 'Address a severe isolate crash when parsing large QR code images on older macOS SDK architectures. Move decoding execution to a clean isolated thread.';
+    } else {
+      description = 'DevOps ticket raised to update release management configs, execute builds, or configure workspace details for the mobile platform.';
+    }
+
+    final isBug = item.type == 'Bug';
+    final isDone = item.status == 'Resolved' || item.status == 'Dev Done' || item.status == 'Done' || item.status == 'Closed';
+
+    showDialog(
+      context: context,
+      builder: (context) {
+        return Dialog(
+          backgroundColor: const Color(0xFF1E1E24),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16),
+            side: const BorderSide(color: Color(0xFF27272A)),
+          ),
+          child: Container(
+            width: 480,
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Row(
+                      children: [
+                        Icon(
+                          isBug ? Icons.bug_report_rounded : Icons.task_rounded,
+                          color: isBug ? const Color(0xFFEF4444) : const Color(0xFF8B5CF6),
+                          size: 20,
+                        ),
+                        const SizedBox(width: 8),
+                        Text(
+                          '${item.type} Details',
+                          style: const TextStyle(
+                            fontFamily: 'Inter',
+                            fontSize: 16,
+                            fontWeight: FontWeight.bold,
+                            color: Colors.white,
+                          ),
+                        ),
+                      ],
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.close_rounded, color: Colors.grey, size: 20),
+                      onPressed: () => Navigator.of(context).pop(),
+                    ),
+                  ],
+                ),
+                const Divider(color: Color(0xFF27272A), height: 24),
+                
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Expanded(
+                      child: Text(
+                        item.title,
+                        style: const TextStyle(
+                          fontFamily: 'Inter',
+                          fontSize: 14,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.white,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                
+                Row(
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF27272A),
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                      child: Text(
+                        'ID: ${item.type}-${item.id}',
+                        style: const TextStyle(
+                          fontFamily: 'Courier',
+                          fontSize: 10,
+                          fontWeight: FontWeight.bold,
+                          color: Color(0xFFA1A1AA),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                      decoration: BoxDecoration(
+                        color: isDone ? const Color(0xFF10B981).withAlpha(38) : const Color(0xFFF59E0B).withAlpha(38),
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                      child: Text(
+                        item.status,
+                        style: TextStyle(
+                          fontFamily: 'Inter',
+                          fontSize: 10,
+                          fontWeight: FontWeight.bold,
+                          color: isDone ? const Color(0xFF10B981) : const Color(0xFFF59E0B),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 20),
+
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF131317),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: const Color(0xFF27272A)),
+                  ),
+                  child: Column(
+                    children: [
+                      _buildMetaRow('System Project', _project.isNotEmpty ? _project : 'SignNext (Demo)'),
+                      const Divider(color: Color(0xFF27272A), height: 16),
+                      _buildMetaRow('Assigned To', _email.isNotEmpty ? _email : 'pavanyadav@crmnext.com'),
+                      const Divider(color: Color(0xFF27272A), height: 16),
+                      _buildMetaRow('Modified Date', '${item.date} (${item.month})'),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 20),
+
+                const Text(
+                  'Description',
+                  style: TextStyle(
+                    fontFamily: 'Inter',
+                    fontSize: 12,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.white,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  description,
+                  style: const TextStyle(
+                    fontFamily: 'Inter',
+                    fontSize: 12,
+                    height: 1.4,
+                    color: Color(0xFFA1A1AA),
+                  ),
+                ),
+                const SizedBox(height: 20),
+
+                const Text(
+                  'Verification & Progress Checklist',
+                  style: TextStyle(
+                    fontFamily: 'Inter',
+                    fontSize: 12,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.white,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                _buildChecklistItem('Code changes committed to feature branch', true),
+                _buildChecklistItem('Local compiler static analysis checks', true),
+                _buildChecklistItem('Unit test suites coverage validation', isDone),
+                _buildChecklistItem('QA verification & sign-off approval', isDone),
+                
+                const SizedBox(height: 24),
+                
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    if (_org.isNotEmpty && _project.isNotEmpty)
+                      OutlinedButton.icon(
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: const Color(0xFF38BDF8),
+                          side: const BorderSide(color: Color(0xFF38BDF8)),
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                        ),
+                        icon: const Icon(Icons.open_in_new_rounded, size: 14),
+                        label: const Text('Open in Azure DevOps', style: TextStyle(fontFamily: 'Inter', fontSize: 11)),
+                        onPressed: () {
+                          final url = 'https://dev.azure.com/$_org/$_project/_workitems/edit/${item.id}';
+                          Process.run('open', [url]);
+                        },
+                      )
+                    else
+                      const SizedBox.shrink(),
+                    ElevatedButton(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFF8B5CF6),
+                        foregroundColor: Colors.white,
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                      ),
+                      onPressed: () => Navigator.of(context).pop(),
+                      child: const Text('Close', style: TextStyle(fontFamily: 'Inter', fontSize: 12, fontWeight: FontWeight.bold)),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  void _showPrDetails(DevOpsPullRequest pr) {
+    String description = '';
+    if (pr.title.contains('zipalign')) {
+      description = 'This PR implements custom directory configuration fields for Android build credentials. Users can save zipalign & apksigner execution pathways directly inside Profile Vault.';
+    } else if (pr.title.contains('signature stripping') || pr.title.contains('drag-drop')) {
+      description = 'Introduces macOS drag-and-drop listener layer to accept app archives, parse the bundle layout, strip active code signature fields, and prepare folders for signing.';
+    } else {
+      description = 'Integration PR merging active development progress, setting config keys, or resolving issues prior to the deployment pipeline run.';
+    }
+
+    final isMerged = pr.status == 'Completed' || pr.status == 'Merged' || pr.status.toLowerCase() == 'completed' || pr.status.toLowerCase() == 'merged';
+
+    showDialog(
+      context: context,
+      builder: (context) {
+        return Dialog(
+          backgroundColor: const Color(0xFF1E1E24),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16),
+            side: const BorderSide(color: Color(0xFF27272A)),
+          ),
+          child: Container(
+            width: 480,
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    const Row(
+                      children: [
+                        Icon(
+                          Icons.alt_route_rounded,
+                          color: Color(0xFF38BDF8),
+                          size: 20,
+                        ),
+                        SizedBox(width: 8),
+                        Text(
+                          'Pull Request Details',
+                          style: TextStyle(
+                            fontFamily: 'Inter',
+                            fontSize: 16,
+                            fontWeight: FontWeight.bold,
+                            color: Colors.white,
+                          ),
+                        ),
+                      ],
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.close_rounded, color: Colors.grey, size: 20),
+                      onPressed: () => Navigator.of(context).pop(),
+                    ),
+                  ],
+                ),
+                const Divider(color: Color(0xFF27272A), height: 24),
+
+                Text(
+                  pr.title,
+                  style: const TextStyle(
+                    fontFamily: 'Inter',
+                    fontSize: 14,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.white,
+                  ),
+                ),
+                const SizedBox(height: 12),
+
+                Row(
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF27272A),
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                      child: Text(
+                        'PR #${pr.id}',
+                        style: const TextStyle(
+                          fontFamily: 'Courier',
+                          fontSize: 10,
+                          fontWeight: FontWeight.bold,
+                          color: Color(0xFFA1A1AA),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                      decoration: BoxDecoration(
+                        color: isMerged ? const Color(0xFF10B981).withAlpha(38) : const Color(0xFF38BDF8).withAlpha(38),
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                      child: Text(
+                        pr.status,
+                        style: TextStyle(
+                          fontFamily: 'Inter',
+                          fontSize: 10,
+                          fontWeight: FontWeight.bold,
+                          color: isMerged ? const Color(0xFF10B981) : const Color(0xFF38BDF8),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 20),
+
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF131317),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: const Color(0xFF27272A)),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        'Branch Flow',
+                        style: TextStyle(fontFamily: 'Inter', fontSize: 10, color: Color(0xFF71717A)),
+                      ),
+                      const SizedBox(height: 6),
+                      Row(
+                        children: [
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFF1E1E24),
+                              borderRadius: BorderRadius.circular(4),
+                              border: Border.all(color: const Color(0xFF8B5CF6).withOpacity(0.3)),
+                            ),
+                            child: Text(
+                              pr.sourceBranch,
+                              style: const TextStyle(fontFamily: 'Courier', fontSize: 11, color: Color(0xFFC084FC), fontWeight: FontWeight.bold),
+                            ),
+                          ),
+                          const Padding(
+                            padding: EdgeInsets.symmetric(horizontal: 8.0),
+                            child: Icon(Icons.arrow_forward_rounded, size: 14, color: Colors.grey),
+                          ),
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFF1E1E24),
+                              borderRadius: BorderRadius.circular(4),
+                              border: Border.all(color: const Color(0xFF10B981).withOpacity(0.3)),
+                            ),
+                            child: Text(
+                              pr.targetBranch,
+                              style: const TextStyle(fontFamily: 'Courier', fontSize: 11, color: Color(0xFF34D399), fontWeight: FontWeight.bold),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 16),
+
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF131317),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: const Color(0xFF27272A)),
+                  ),
+                  child: Column(
+                    children: [
+                      _buildMetaRow('Repository', pr.repo),
+                      const Divider(color: Color(0xFF27272A), height: 16),
+                      _buildMetaRow('Created Date', '${pr.date} (${pr.month})'),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 20),
+
+                const Text(
+                  'Summary Description',
+                  style: TextStyle(
+                    fontFamily: 'Inter',
+                    fontSize: 12,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.white,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  description,
+                  style: const TextStyle(
+                    fontFamily: 'Inter',
+                    fontSize: 12,
+                    height: 1.4,
+                    color: Color(0xFFA1A1AA),
+                  ),
+                ),
+                const SizedBox(height: 20),
+
+                const Text(
+                  'Reviewers Status',
+                  style: TextStyle(
+                    fontFamily: 'Inter',
+                    fontSize: 12,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.white,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                _buildReviewerRow('Sachin (Lead Mobile Dev)', isMerged ? 'Approved' : 'Pending', isMerged),
+                _buildReviewerRow('Anuj (QA Engineer)', isMerged ? 'Approved' : 'Pending', isMerged),
+                _buildReviewerRow('Pavan Yadav (Developer)', 'Author', true),
+
+                const SizedBox(height: 24),
+
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    if (_org.isNotEmpty && _project.isNotEmpty)
+                      OutlinedButton.icon(
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: const Color(0xFF38BDF8),
+                          side: const BorderSide(color: Color(0xFF38BDF8)),
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                        ),
+                        icon: const Icon(Icons.open_in_new_rounded, size: 14),
+                        label: const Text('View PR in DevOps', style: TextStyle(fontFamily: 'Inter', fontSize: 11)),
+                        onPressed: () {
+                          final url = 'https://dev.azure.com/$_org/$_project/_git/${pr.repo}/pullrequest/${pr.id}';
+                          Process.run('open', [url]);
+                        },
+                      )
+                    else
+                      const SizedBox.shrink(),
+                    ElevatedButton(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFF8B5CF6),
+                        foregroundColor: Colors.white,
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                      ),
+                      onPressed: () => Navigator.of(context).pop(),
+                      child: const Text('Close', style: TextStyle(fontFamily: 'Inter', fontSize: 12, fontWeight: FontWeight.bold)),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildMetaRow(String label, String value) {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      children: [
+        Text(label, style: const TextStyle(fontFamily: 'Inter', fontSize: 11, color: Color(0xFF71717A))),
+        Text(value, style: const TextStyle(fontFamily: 'Courier', fontSize: 11, fontWeight: FontWeight.bold, color: Colors.white)),
+      ],
+    );
+  }
+
+  Widget _buildReviewerRow(String name, String status, bool approved) {
+    Color statusColor = Colors.grey;
+    IconData statusIcon = Icons.help_outline_rounded;
+    if (status == 'Approved') {
+      statusColor = const Color(0xFF10B981);
+      statusIcon = Icons.check_circle_rounded;
+    } else if (status == 'Author') {
+      statusColor = const Color(0xFF38BDF8);
+      statusIcon = Icons.person_rounded;
+    } else if (status == 'Pending') {
+      statusColor = const Color(0xFFF59E0B);
+      statusIcon = Icons.hourglass_empty_rounded;
+    }
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4.0),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Text(name, style: const TextStyle(fontFamily: 'Inter', fontSize: 11, color: Colors.white70)),
+          Row(
+            children: [
+              Icon(statusIcon, size: 12, color: statusColor),
+              const SizedBox(width: 4),
+              Text(
+                status,
+                style: TextStyle(
+                  fontFamily: 'Inter',
+                  fontSize: 10,
+                  fontWeight: FontWeight.bold,
+                  color: statusColor,
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildChecklistItem(String task, bool checked) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 2.0),
+      child: Row(
+        children: [
+          Icon(
+            checked ? Icons.check_box_rounded : Icons.check_box_outline_blank_rounded,
+            size: 14,
+            color: checked ? const Color(0xFF10B981) : const Color(0xFF52525B),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              task,
+              style: TextStyle(
+                fontFamily: 'Inter',
+                fontSize: 11,
+                color: checked ? Colors.white70 : const Color(0xFF71717A),
+                decoration: checked ? TextDecoration.lineThrough : null,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _generateAiStandupReport() async {
+    setState(() {
+      _generatingStandup = true;
+      _aiStandupText = null;
+    });
+
+    await Future.delayed(const Duration(milliseconds: 1200));
+
+    final completed = _workItems.where((wi) => wi.status == 'Resolved' || wi.status == 'Dev Done').toList();
+    final inProgress = _workItems.where((wi) => wi.status == 'In Progress').toList();
+    final activePrs = _prs.where((pr) => pr.status == 'Active' || pr.status == 'active').toList();
+
+    final buffer = StringBuffer();
+    buffer.writeln('🚀 *DAILY STANDUP AI SUMMARY - RELEASE MANAGEMENT*');
+    buffer.writeln('\n**Yesterday (Completed):**');
+    if (completed.isEmpty) {
+      buffer.writeln('- Finished code signing pipeline integrations and cert syncs.');
+    } else {
+      for (final item in completed.take(3)) {
+        buffer.writeln('- Resolved [${item.type}-${item.id}] ${item.title}');
+      }
+    }
+
+    buffer.writeln('\n**Today (Active):**');
+    if (inProgress.isEmpty) {
+      buffer.writeln('- Implementing drag & drop digital signature strip utility.');
+    } else {
+      for (final item in inProgress.take(2)) {
+        buffer.writeln('- Working on [${item.type}-${item.id}] ${item.title}');
+      }
+    }
+    for (final pr in activePrs.take(2)) {
+      buffer.writeln('- Monitoring active PR #${pr.id} (${pr.sourceBranch} -> ${pr.targetBranch})');
+    }
+
+    buffer.writeln('\n**Blockers:**');
+    buffer.writeln('- None. Running final code review builds.');
+
+    setState(() {
+      _generatingStandup = false;
+      _aiStandupText = buffer.toString();
+    });
+  }
+
+  Future<void> _exportPdfReport(bool isWeekly) async {
+    final pdf = pw.Document();
+
+    final theme = pw.ThemeData.withFont(
+      base: pw.Font.helvetica(),
+      bold: pw.Font.helveticaBold(),
+    );
+
+    pdf.addPage(
+      pw.MultiPage(
+        theme: theme,
+        pageFormat: PdfPageFormat.a4,
+        build: (pw.Context context) {
+          return [
+            pw.Header(
+              level: 0,
+              child: pw.Row(
+                mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
+                children: [
+                  pw.Text('SignNext DevOps Status Report', style: pw.TextStyle(fontSize: 22, fontWeight: pw.FontWeight.bold, color: PdfColors.purple)),
+                  pw.Text(isWeekly ? 'WEEKLY SUMMARY' : 'MONTHLY SUMMARY', style: pw.TextStyle(fontSize: 12, color: PdfColors.grey)),
+                ],
+              ),
+            ),
+            pw.SizedBox(height: 12),
+            pw.Text('Generated by: $_email on ${DateTime.now().toLocal().toString().substring(0, 16)}', style: pw.TextStyle(fontSize: 10, color: PdfColors.grey600)),
+            pw.SizedBox(height: 16),
+            
+            pw.Text('Performance Summary Metrics', style: pw.TextStyle(fontSize: 14, fontWeight: pw.FontWeight.bold, color: PdfColors.purple)),
+            pw.Divider(color: PdfColors.grey400),
+            pw.SizedBox(height: 8),
+            pw.Row(
+              mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
+              children: [
+                pw.Text('Total Synced Tasks: ${_workItems.length}', style: pw.TextStyle(fontSize: 11)),
+                pw.Text('Completed Tasks: ${_workItems.where((wi) => wi.status == 'Resolved' || wi.status == 'Dev Done').length}', style: pw.TextStyle(fontSize: 11)),
+                pw.Text('Total PRs: ${_prs.length}', style: pw.TextStyle(fontSize: 11)),
+              ],
+            ),
+            pw.SizedBox(height: 20),
+
+            pw.Text('Work Items Timeline Log', style: pw.TextStyle(fontSize: 14, fontWeight: pw.FontWeight.bold, color: PdfColors.purple)),
+            pw.Divider(color: PdfColors.grey400),
+            pw.SizedBox(height: 8),
+            ..._workItems.map((item) {
+              return pw.Padding(
+                padding: const pw.EdgeInsets.symmetric(vertical: 4),
+                child: pw.Row(
+                  mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
+                  children: [
+                    pw.Expanded(
+                      child: pw.Column(
+                        crossAxisAlignment: pw.CrossAxisAlignment.start,
+                        children: [
+                          pw.Text('[${item.type}-${item.id}] ${item.title}', style: pw.TextStyle(fontSize: 10, fontWeight: pw.FontWeight.bold)),
+                          pw.Text('Date: ${item.date} (${item.month})', style: pw.TextStyle(fontSize: 8, color: PdfColors.grey600)),
+                        ],
+                      ),
+                    ),
+                    pw.Text(
+                      item.status,
+                      style: pw.TextStyle(
+                        fontSize: 9,
+                        fontWeight: pw.FontWeight.bold,
+                        color: (item.status == 'Resolved' || item.status == 'Dev Done') ? PdfColors.green : PdfColors.orange,
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            }),
+
+            pw.SizedBox(height: 20),
+            pw.Text('Pull Request Release Logs', style: pw.TextStyle(fontSize: 14, fontWeight: pw.FontWeight.bold, color: PdfColors.purple)),
+            pw.Divider(color: PdfColors.grey400),
+            pw.SizedBox(height: 8),
+            ..._prs.map((pr) {
+              return pw.Padding(
+                padding: const pw.EdgeInsets.symmetric(vertical: 4),
+                child: pw.Row(
+                  mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
+                  children: [
+                    pw.Expanded(
+                      child: pw.Column(
+                        crossAxisAlignment: pw.CrossAxisAlignment.start,
+                        children: [
+                          pw.Text('PR #${pr.id}: ${pr.title}', style: pw.TextStyle(fontSize: 10, fontWeight: pw.FontWeight.bold)),
+                          pw.Text('Branch: ${pr.sourceBranch} -> ${pr.targetBranch} | Repo: ${pr.repo}', style: pw.TextStyle(fontSize: 8, color: PdfColors.grey600)),
+                        ],
+                      ),
+                    ),
+                    pw.Text(
+                      pr.status.toUpperCase(),
+                      style: pw.TextStyle(
+                        fontSize: 9,
+                        fontWeight: pw.FontWeight.bold,
+                        color: (pr.status == 'Completed' || pr.status == 'Merged') ? PdfColors.green : PdfColors.blue,
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            }),
+          ];
+        },
+      ),
+    );
+
+    try {
+      final bytes = await pdf.save();
+      final fileName = isWeekly ? 'DevOps_Weekly_Report.pdf' : 'DevOps_Monthly_Report.pdf';
+      final path = await FilePicker.platform.saveFile(
+        dialogTitle: 'Export DevOps Report',
+        fileName: fileName,
+        bytes: bytes,
+      );
+
+      if (path != null) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Activity report saved to $path successfully!'),
+            backgroundColor: const Color(0xFF10B981),
+          ),
+        );
+      }
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Failed to save PDF: $e'),
+          backgroundColor: const Color(0xFFEF4444),
+        ),
+      );
+    }
+  }
+
+  void _showCredentialsDialog() {
+    showDialog(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          backgroundColor: const Color(0xFF1E1E22),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16), side: const BorderSide(color: Color(0xFF27272A))),
+          title: const Text('Connect Azure DevOps', style: TextStyle(fontFamily: 'Inter', fontWeight: FontWeight.bold, color: Colors.white)),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                _buildDialogField(label: 'Azure DevOps Organization', controller: _orgController, hint: 'e.g. crmnext-dev'),
+                const SizedBox(height: 12),
+                _buildDialogField(label: 'Project Name', controller: _projectController, hint: 'e.g. sign-next'),
+                const SizedBox(height: 12),
+                _buildDialogField(label: 'Personal Access Token (PAT)', controller: _patController, hint: 'Azure PAT Token', obscure: true),
+                const SizedBox(height: 12),
+                _buildDialogField(label: 'User Account Email', controller: _emailController, hint: 'e.g. developer@crmnext.com'),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Cancel', style: TextStyle(color: Colors.grey)),
+            ),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF8B5CF6), foregroundColor: Colors.white),
+              onPressed: _saveCredentials,
+              child: const Text('Save & Connect', style: TextStyle(fontWeight: FontWeight.bold)),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Widget _buildDialogField({required String label, required TextEditingController controller, required String hint, bool obscure = false}) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text(label, style: const TextStyle(fontFamily: 'Inter', fontSize: 13, color: Color(0xFFA1A1AA))),
-        const SizedBox(height: 6),
+        Text(label, style: const TextStyle(fontFamily: 'Inter', fontSize: 11, color: Color(0xFFA1A1AA))),
+        const SizedBox(height: 4),
         TextField(
           controller: controller,
           obscureText: obscure,
-          style: const TextStyle(fontFamily: 'Courier', fontSize: 12, color: Colors.white),
+          style: const TextStyle(fontFamily: 'Inter', fontSize: 13, color: Colors.white),
           decoration: InputDecoration(
             hintText: hint,
             hintStyle: const TextStyle(color: Color(0xFF52525B)),
             fillColor: const Color(0xFF0F0F12),
             filled: true,
-            contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+            contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
             enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: const BorderSide(color: Color(0xFF27272A))),
             focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: const BorderSide(color: Color(0xFF8B5CF6))),
           ),
@@ -3748,74 +6482,476 @@ class _SettingsWidgetState extends State<SettingsWidget> {
     );
   }
 
-  Widget _buildIosFilePickerField({required String label, required TextEditingController controller, required String hint, required List<String> extensions}) {
-    return Column(
+  @override
+  Widget build(BuildContext context) {
+    return Row(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text(label, style: const TextStyle(fontFamily: 'Inter', fontSize: 13, color: Color(0xFFA1A1AA))),
-        const SizedBox(height: 6),
-        Row(
-          children: [
-            Expanded(
-              child: TextField(
-                controller: controller,
-                style: const TextStyle(fontFamily: 'Courier', fontSize: 12, color: Colors.white),
-                decoration: InputDecoration(
-                  hintText: hint,
-                  hintStyle: const TextStyle(color: Color(0xFF52525B)),
-                  fillColor: const Color(0xFF0F0F12),
-                  filled: true,
-                  contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-                  enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: const BorderSide(color: Color(0xFF27272A))),
-                  focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: const BorderSide(color: Color(0xFF8B5CF6))),
+        Expanded(
+          flex: 6,
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          'DevOps Activity Dashboard',
+                          style: TextStyle(fontFamily: 'Inter', fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white),
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          _org.isNotEmpty ? 'Syncing project: $_project' : 'Running in Simulated Demo Mode',
+                          style: const TextStyle(fontFamily: 'Inter', fontSize: 12, color: Color(0xFFA1A1AA)),
+                        ),
+                      ],
+                    ),
+                    Row(
+                      children: [
+                        ElevatedButton.icon(
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: const Color(0xFF1E1E22),
+                            foregroundColor: Colors.white,
+                            side: const BorderSide(color: Color(0xFF27272A)),
+                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                          ),
+                          icon: const Icon(Icons.settings_rounded, size: 16),
+                          label: const Text('ADO Settings', style: TextStyle(fontFamily: 'Inter', fontSize: 12)),
+                          onPressed: _showCredentialsDialog,
+                        ),
+                        const SizedBox(width: 10),
+                        ElevatedButton.icon(
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: const Color(0xFF8B5CF6),
+                            foregroundColor: Colors.white,
+                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                          ),
+                          icon: _isLoading 
+                            ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                            : const Icon(Icons.sync_rounded, size: 16),
+                          label: const Text('Refresh', style: TextStyle(fontFamily: 'Inter', fontSize: 12, fontWeight: FontWeight.bold)),
+                          onPressed: _isLoading ? null : _syncDevOps,
+                        ),
+                      ],
+                    ),
+                  ],
                 ),
-              ),
+                const SizedBox(height: 24),
+
+                if (_errorMessage != null) ...[
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(color: const Color(0xFFEF4444).withAlpha(30), borderRadius: BorderRadius.circular(8), border: Border.all(color: const Color(0xFFEF4444))),
+                    child: Row(
+                      children: [
+                        const Icon(Icons.error_outline_rounded, color: Color(0xFFEF4444), size: 16),
+                        const SizedBox(width: 10),
+                        Expanded(child: Text(_errorMessage!, style: const TextStyle(fontFamily: 'Inter', fontSize: 12, color: Color(0xFFEF4444)))),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                ],
+
+                Row(
+                  children: [
+                    _buildStatCard('Bugs Closed', _workItems.where((wi) => wi.type == 'Bug' && (wi.status == 'Resolved' || wi.status == 'Dev Done' || wi.status == 'Closed' || wi.status == 'Done')).length.toString(), Icons.bug_report_rounded, const Color(0xFFEF4444)),
+                    const SizedBox(width: 16),
+                    _buildStatCard('Tasks Finished', _workItems.where((wi) => wi.type == 'Task' && (wi.status == 'Resolved' || wi.status == 'Dev Done' || wi.status == 'Closed' || wi.status == 'Done')).length.toString(), Icons.check_circle_outline_rounded, const Color(0xFF10B981)),
+                    const SizedBox(width: 16),
+                    _buildStatCard('Active PRs', _prs.where((pr) => pr.status == 'Active' || pr.status == 'active').length.toString(), Icons.alt_route_rounded, const Color(0xFF38BDF8)),
+                  ],
+                ),
+                const SizedBox(height: 24),
+
+                Container(
+                  padding: const EdgeInsets.all(20),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF1E1E22),
+                    borderRadius: BorderRadius.circular(16),
+                    border: Border.all(color: const Color(0xFF27272A)),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        'Weekly Completion Velocity (Mon - Fri)',
+                        style: TextStyle(fontFamily: 'Inter', fontSize: 14, fontWeight: FontWeight.bold, color: Colors.white),
+                      ),
+                      const SizedBox(height: 24),
+                      AnimatedBuilder(
+                        animation: _chartAnimation,
+                        builder: (context, child) {
+                          return SizedBox(
+                            width: double.infinity,
+                            height: 160,
+                            child: CustomPaint(
+                              painter: DevOpsStatusChart(
+                                weeklyWorkCounts: _weeklyActivity,
+                                animationValue: _chartAnimation.value,
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+                      const SizedBox(height: 14),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 24),
+
+                Container(
+                  padding: const EdgeInsets.all(20),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF0F0F12),
+                    borderRadius: BorderRadius.circular(16),
+                    border: Border.all(color: const Color(0xFF27272A)),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          const Row(
+                            children: [
+                              Icon(Icons.auto_awesome_rounded, color: Color(0xFF8B5CF6), size: 18),
+                              SizedBox(width: 8),
+                              Text('AI Standup Update Generator', style: TextStyle(fontFamily: 'Inter', fontSize: 14, fontWeight: FontWeight.bold, color: Colors.white)),
+                            ],
+                          ),
+                          ElevatedButton.icon(
+                            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF8B5CF6), foregroundColor: Colors.white, shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8))),
+                            icon: const Icon(Icons.psychology_rounded, size: 16),
+                            label: const Text('Summarize Standup', style: TextStyle(fontFamily: 'Inter', fontSize: 12, fontWeight: FontWeight.bold)),
+                            onPressed: _generatingStandup ? null : _generateAiStandupReport,
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 12),
+                      if (_generatingStandup) ...[
+                        const Center(child: Padding(padding: EdgeInsets.all(12.0), child: CircularProgressIndicator(color: Color(0xFF8B5CF6)))),
+                      ] else if (_aiStandupText != null) ...[
+                        Container(
+                          width: double.infinity,
+                          padding: const EdgeInsets.all(16),
+                          decoration: BoxDecoration(color: const Color(0xFF131317), borderRadius: BorderRadius.circular(10), border: Border.all(color: const Color(0xFF27272A))),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                _aiStandupText!,
+                                style: const TextStyle(fontFamily: 'Courier', fontSize: 12, height: 1.4, color: Colors.white70),
+                              ),
+                              const SizedBox(height: 10),
+                              Align(
+                                alignment: Alignment.bottomRight,
+                                child: TextButton.icon(
+                                  icon: const Icon(Icons.copy_rounded, size: 14, color: Color(0xFF10B981)),
+                                  label: const Text('Copy to Clipboard', style: TextStyle(fontFamily: 'Inter', fontSize: 11, color: Color(0xFF10B981))),
+                                  onPressed: () {
+                                    Clipboard.setData(ClipboardData(text: _aiStandupText!));
+                                    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Standup summary copied to clipboard!')));
+                                  },
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ] else ...[
+                        const Text(
+                          'Generate a formatted, AI-summarized standup updates compiled from your active tickets and branch activity logs.',
+                          style: TextStyle(fontFamily: 'Inter', fontSize: 12, color: Color(0xFFA1A1AA)),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+              ],
             ),
-            const SizedBox(width: 8),
-            ElevatedButton(
-              style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF27272A), foregroundColor: Colors.white, padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8))),
-              onPressed: () => _pickFile(controller, extensions),
-              child: const Text('Browse', style: TextStyle(fontFamily: 'Inter', fontSize: 13)),
+          ),
+        ),
+        
+        Expanded(
+          flex: 4,
+          child: Container(
+            height: double.infinity,
+            decoration: const BoxDecoration(
+              color: Color(0xFF0F0F12),
+              border: Border(left: BorderSide(color: Color(0xFF27272A), width: 1)),
             ),
-          ],
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text('Generate Export Report', style: TextStyle(fontFamily: 'Inter', fontSize: 14, fontWeight: FontWeight.bold, color: Colors.white)),
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    Expanded(
+                      child: ElevatedButton.icon(
+                        style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF1E1E22), foregroundColor: Colors.white, side: const BorderSide(color: Color(0xFF27272A)), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8))),
+                        icon: const Icon(Icons.picture_as_pdf_rounded, size: 16, color: Color(0xFFEF4444)),
+                        label: const Text('Mon-Fri Weekly', style: TextStyle(fontFamily: 'Inter', fontSize: 11)),
+                        onPressed: () => _exportPdfReport(true),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: ElevatedButton.icon(
+                        style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF1E1E22), foregroundColor: Colors.white, side: const BorderSide(color: Color(0xFF27272A)), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8))),
+                        icon: const Icon(Icons.picture_as_pdf_rounded, size: 16, color: Color(0xFFEF4444)),
+                        label: const Text('Monthly Report', style: TextStyle(fontFamily: 'Inter', fontSize: 11)),
+                        onPressed: () => _exportPdfReport(false),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 20),
+                const Divider(color: Color(0xFF27272A)),
+                const SizedBox(height: 16),
+
+                const Text('Assigned Work Items', style: TextStyle(fontFamily: 'Inter', fontSize: 14, fontWeight: FontWeight.bold, color: Colors.white)),
+                const SizedBox(height: 14),
+                Expanded(
+                  flex: 3,
+                  child: ListView.builder(
+                    itemCount: _workItems.length,
+                    itemBuilder: (context, index) {
+                      final item = _workItems[index];
+                      final isBug = item.type == 'Bug';
+                      final isDone = item.status == 'Resolved' || item.status == 'Dev Done' || item.status == 'Done' || item.status == 'Closed';
+                      return Padding(
+                        padding: const EdgeInsets.only(bottom: 8.0),
+                        child: Material(
+                          color: Colors.transparent,
+                          child: InkWell(
+                            borderRadius: BorderRadius.circular(10),
+                            onTap: () => _showWorkItemDetails(item),
+                            child: Ink(
+                              padding: const EdgeInsets.all(12),
+                              decoration: BoxDecoration(
+                                color: const Color(0xFF1E1E22),
+                                borderRadius: BorderRadius.circular(10),
+                                border: Border.all(color: const Color(0xFF27272A)),
+                              ),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Row(
+                                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                    children: [
+                                      Row(
+                                        children: [
+                                          Icon(isBug ? Icons.bug_report_rounded : Icons.task_rounded, size: 14, color: isBug ? const Color(0xFFEF4444) : const Color(0xFF8B5CF6)),
+                                          const SizedBox(width: 6),
+                                          Text('[${item.type}-${item.id}]', style: const TextStyle(fontFamily: 'Courier', fontSize: 10, fontWeight: FontWeight.bold, color: Color(0xFFA1A1AA))),
+                                        ],
+                                      ),
+                                      Container(
+                                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                        decoration: BoxDecoration(
+                                          color: isDone ? const Color(0xFF10B981).withAlpha(38) : const Color(0xFFF59E0B).withAlpha(38),
+                                          borderRadius: BorderRadius.circular(4),
+                                        ),
+                                        child: Text(
+                                          item.status,
+                                          style: TextStyle(fontFamily: 'Inter', fontSize: 9, fontWeight: FontWeight.bold, color: isDone ? const Color(0xFF10B981) : const Color(0xFFF59E0B)),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                  const SizedBox(height: 8),
+                                  Text(item.title, style: const TextStyle(fontFamily: 'Inter', fontSize: 12, fontWeight: FontWeight.bold, color: Colors.white), maxLines: 2, overflow: TextOverflow.ellipsis),
+                                  const SizedBox(height: 6),
+                                  Text('Modified: ${item.date} (${item.month})', style: const TextStyle(fontFamily: 'Inter', fontSize: 10, color: Color(0xFF71717A))),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+                
+                const SizedBox(height: 16),
+                const Divider(color: Color(0xFF27272A)),
+                const SizedBox(height: 16),
+
+                const Text('Linked Pull Requests', style: TextStyle(fontFamily: 'Inter', fontSize: 14, fontWeight: FontWeight.bold, color: Colors.white)),
+                const SizedBox(height: 14),
+                Expanded(
+                  flex: 2,
+                  child: ListView.builder(
+                    itemCount: _prs.length,
+                    itemBuilder: (context, index) {
+                      final pr = _prs[index];
+                      final isMerged = pr.status == 'Completed' || pr.status == 'Merged';
+                      return Padding(
+                        padding: const EdgeInsets.only(bottom: 8.0),
+                        child: Material(
+                          color: Colors.transparent,
+                          child: InkWell(
+                            borderRadius: BorderRadius.circular(10),
+                            onTap: () => _showPrDetails(pr),
+                            child: Ink(
+                              padding: const EdgeInsets.all(12),
+                              decoration: BoxDecoration(
+                                color: const Color(0xFF1E1E22),
+                                borderRadius: BorderRadius.circular(10),
+                                border: Border.all(color: const Color(0xFF27272A)),
+                              ),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Row(
+                                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                    children: [
+                                      Row(
+                                        children: [
+                                          const Icon(Icons.alt_route_rounded, size: 14, color: Color(0xFF38BDF8)),
+                                          const SizedBox(width: 6),
+                                          Text('PR #${pr.id}', style: const TextStyle(fontFamily: 'Courier', fontSize: 10, fontWeight: FontWeight.bold, color: Color(0xFFA1A1AA))),
+                                        ],
+                                      ),
+                                      Container(
+                                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                        decoration: BoxDecoration(
+                                          color: isMerged ? const Color(0xFF10B981).withAlpha(38) : const Color(0xFF38BDF8).withAlpha(38),
+                                          borderRadius: BorderRadius.circular(4),
+                                        ),
+                                        child: Text(
+                                          pr.status,
+                                          style: TextStyle(fontFamily: 'Inter', fontSize: 9, fontWeight: FontWeight.bold, color: isMerged ? const Color(0xFF10B981) : const Color(0xFF38BDF8)),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                  const SizedBox(height: 8),
+                                  Text(pr.title, style: const TextStyle(fontFamily: 'Inter', fontSize: 12, fontWeight: FontWeight.bold, color: Colors.white), maxLines: 1, overflow: TextOverflow.ellipsis),
+                                  const SizedBox(height: 4),
+                                  Text('Branch: ${pr.sourceBranch} -> ${pr.targetBranch}', style: const TextStyle(fontFamily: 'Courier', fontSize: 9, color: Color(0xFF71717A)), maxLines: 1, overflow: TextOverflow.ellipsis),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+              ],
+            ),
+          ),
         ),
       ],
     );
   }
 
-  Widget _buildBinaryPathField({required String label, required TextEditingController controller, required String hint}) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Text(label, style: const TextStyle(fontFamily: 'Inter', fontSize: 13, color: Color(0xFFA1A1AA))),
-        const SizedBox(height: 6),
-        Row(
+  Widget _buildStatCard(String label, String value, IconData icon, Color color) {
+    return Expanded(
+      child: Container(
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(color: const Color(0xFF1E1E22), borderRadius: BorderRadius.circular(12), border: Border.all(color: const Color(0xFF27272A))),
+        child: Row(
           children: [
-            Expanded(
-              child: TextField(
-                controller: controller,
-                style: const TextStyle(fontFamily: 'Courier', fontSize: 12, color: Colors.white),
-                decoration: InputDecoration(
-                  hintText: hint,
-                  hintStyle: const TextStyle(color: Color(0xFF52525B)),
-                  fillColor: const Color(0xFF0F0F12),
-                  filled: true,
-                  contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-                  enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: const BorderSide(color: Color(0xFF27272A))),
-                  focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: const BorderSide(color: Color(0xFF8B5CF6))),
-                ),
-              ),
+            Container(
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(color: color.withOpacity(0.12), borderRadius: BorderRadius.circular(10)),
+              child: Icon(icon, color: color, size: 20),
             ),
-            const SizedBox(width: 8),
-            ElevatedButton(
-              style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF27272A), foregroundColor: Colors.white, padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8))),
-              onPressed: () => _pickBinaryPath(controller),
-              child: const Text('Browse', style: TextStyle(fontFamily: 'Inter', fontSize: 13)),
+            const SizedBox(width: 14),
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(label, style: const TextStyle(fontFamily: 'Inter', fontSize: 11, color: Color(0xFFA1A1AA))),
+                const SizedBox(height: 4),
+                Text(value, style: const TextStyle(fontFamily: 'Inter', fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white)),
+              ],
             ),
           ],
         ),
-      ],
+      ),
     );
+  }
+}
+
+class DevOpsStatusChart extends CustomPainter {
+  final List<double> weeklyWorkCounts;
+  final double animationValue;
+
+  DevOpsStatusChart({required this.weeklyWorkCounts, required this.animationValue});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()..style = PaintingStyle.fill;
+    final gridPaint = Paint()..color = const Color(0xFF27272A)..strokeWidth = 1;
+
+    for (int i = 0; i <= 4; i++) {
+      double y = size.height * (i / 4);
+      canvas.drawLine(Offset(0, y), Offset(size.width, y), gridPaint);
+    }
+
+    final barWidth = size.width / 12;
+    final spacing = size.width / 6;
+
+    final List<String> days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri'];
+    final List<Color> colors = [
+      const Color(0xFF8B5CF6),
+      const Color(0xFF10B981),
+      const Color(0xFF38BDF8),
+      const Color(0xFFF59E0B),
+      const Color(0xFFEF4444)
+    ];
+
+    double maxVal = 5.0;
+    for (int i = 0; i < weeklyWorkCounts.length; i++) {
+      double val = weeklyWorkCounts[i];
+      double barHeight = (val / maxVal) * size.height * animationValue;
+      barHeight = barHeight.clamp(0.0, size.height);
+
+      double x = spacing * (i + 1) - (barWidth / 2);
+      double y = size.height - barHeight;
+
+      paint.shader = ui.Gradient.linear(
+        Offset(x, size.height),
+        Offset(x, y),
+        [colors[i].withOpacity(0.2), colors[i]],
+      );
+
+      final rect = RRect.fromRectAndRadius(
+        Rect.fromLTWH(x, y, barWidth, barHeight),
+        const Radius.circular(4),
+      );
+      canvas.drawRRect(rect, paint);
+
+      final textPainter = TextPainter(
+        text: TextSpan(text: days[i], style: const TextStyle(fontFamily: 'Inter', fontSize: 10, color: Color(0xFFA1A1AA))),
+        textDirection: TextDirection.ltr,
+      )..layout();
+      textPainter.paint(canvas, Offset(x + (barWidth / 2) - (textPainter.width / 2), size.height + 6));
+
+      if (barHeight > 10) {
+        final valPainter = TextPainter(
+          text: TextSpan(text: val.toInt().toString(), style: const TextStyle(fontFamily: 'Courier', fontSize: 10, fontWeight: FontWeight.bold, color: Colors.white)),
+          textDirection: TextDirection.ltr,
+        )..layout();
+        valPainter.paint(canvas, Offset(x + (barWidth / 2) - (valPainter.width / 2), y - 14));
+      }
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant DevOpsStatusChart oldDelegate) {
+    return oldDelegate.animationValue != animationValue || oldDelegate.weeklyWorkCounts != weeklyWorkCounts;
   }
 }
 
@@ -3824,9 +6960,8 @@ class _SettingsWidgetState extends State<SettingsWidget> {
 // ==========================================
 class LoginScreen extends StatefulWidget {
   final Function(String) onLoginSuccess;
-  final VoidCallback onSkip;
 
-  const LoginScreen({super.key, required this.onLoginSuccess, required this.onSkip});
+  const LoginScreen({super.key, required this.onLoginSuccess});
 
   @override
   State<LoginScreen> createState() => _LoginScreenState();
@@ -4082,16 +7217,6 @@ class _LoginScreenState extends State<LoginScreen> {
                           });
                         },
                       ),
-                      const SizedBox(height: 24),
-                      const Divider(color: Color(0xFF27272A)),
-                      const SizedBox(height: 12),
-                      TextButton(
-                        onPressed: widget.onSkip,
-                        child: const Text(
-                          'Skip signing (Go to App as Guest)',
-                          style: TextStyle(fontFamily: 'Inter', fontSize: 12, color: Color(0xFF10B981), decoration: TextDecoration.underline),
-                        ),
-                      ),
                     ] else ...[
                       Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
@@ -4223,284 +7348,6 @@ class _LoginScreenState extends State<LoginScreen> {
 }
 
 // ==========================================
-// ORG SHARING DIALOG WIDGET
-// ==========================================
-class ShareDialogWidget extends StatefulWidget {
-  final SignedAppHistoryItem app;
-  final String? userEmail;
-
-  const ShareDialogWidget({super.key, required this.app, this.userEmail});
-
-  @override
-  State<ShareDialogWidget> createState() => _ShareDialogWidgetState();
-}
-
-class _ShareDialogWidgetState extends State<ShareDialogWidget> {
-  final _emailController = TextEditingController();
-  bool _sharing = false;
-  String _status = '';
-  String _searchQuery = '';
-
-  static const List<Map<String, String>> _mockOrgUsers = [
-    {'name': 'Mahiba Patel', 'email': 'mahiba.patel@crmnext.com'},
-    {'name': 'Mahib Rahman', 'email': 'mahib.rahman@crmnext.com'},
-    {'name': 'Pavan Yadav', 'email': 'pavan.yadav@crmnext.com'},
-    {'name': 'Deepak Sharma', 'email': 'deepak.sharma@crmnext.com'},
-    {'name': 'Preeti Sen', 'email': 'preeti.sen@crmnext.com'},
-    {'name': 'Vikas Mishra', 'email': 'vikas.mishra@crmnext.com'},
-    {'name': 'Rahul Verma', 'email': 'rahul.verma@crmnext.com'},
-    {'name': 'Amit Gupta', 'email': 'amit.gupta@crmnext.com'},
-    {'name': 'Sanjay Singh', 'email': 'sanjay.singh@crmnext.com'},
-    {'name': 'Neha Goel', 'email': 'neha.goel@crmnext.com'},
-  ];
-
-  List<Map<String, String>> _getFilteredUsers() {
-    if (_searchQuery.isEmpty) return [];
-    final query = _searchQuery.toLowerCase();
-    final matches = _mockOrgUsers.where((user) {
-      return user['name']!.toLowerCase().contains(query) ||
-             user['email']!.toLowerCase().contains(query);
-    }).toList();
-    if (matches.length > 5) {
-      return matches.sublist(0, 5);
-    }
-    return matches;
-  }
-
-  void _shareOverTeams() async {
-    final email = _emailController.text.trim();
-    if (email.isEmpty || !email.contains('@')) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Please enter a valid recipient email.')),
-      );
-      return;
-    }
-
-    setState(() {
-      _sharing = true;
-      _status = 'Compressing package to secure .zip archive...';
-    });
-
-    final filePath = widget.app.filePath;
-    final baseDir = p.dirname(filePath);
-    final baseName = p.basenameWithoutExtension(filePath);
-    final zipPath = p.join(baseDir, '$baseName.zip');
-
-    try {
-      if (Platform.isMacOS) {
-        await Process.run('zip', ['-j', zipPath, filePath]);
-      } else if (Platform.isWindows) {
-        await Process.run('powershell.exe', [
-          '-Command',
-          'Compress-Archive -Path "${filePath}" -DestinationPath "${zipPath}" -Force'
-        ]);
-      }
-    } catch (_) {}
-
-    setState(() {
-      _status = 'Launching Microsoft Teams chat with $email...';
-    });
-
-    await Future.delayed(const Duration(milliseconds: 800));
-
-    // Open compressed file in Finder/Explorer
-    try {
-      if (Platform.isMacOS) {
-        await Process.run('open', ['-R', zipPath]);
-      } else if (Platform.isWindows) {
-        await Process.run('explorer.exe', ['/select,', zipPath]);
-      }
-    } catch (_) {}
-
-    // Launch Microsoft Teams deep link chat with user and prefill message
-    final encodedMessage = Uri.encodeComponent(
-        'Hi, I have signed the app "${widget.app.name}" (${widget.app.platform.toUpperCase()}).\n\n'
-        'Bundle ID: ${widget.app.packageId}\n'
-        'Version: ${widget.app.versionName} (${widget.app.versionCode})\n\n'
-        'I have created a compressed ZIP archive of the build in my Finder. Please drag and drop it into this chat!');
-    
-    final teamsUrl = 'https://teams.microsoft.com/l/chat/0/0?users=$email&message=$encodedMessage';
-
-    try {
-      if (Platform.isMacOS) {
-        await Process.run('open', [teamsUrl]);
-      } else if (Platform.isWindows) {
-        await Process.run('cmd.exe', ['/c', 'start', teamsUrl]);
-      }
-    } catch (_) {}
-
-    if (mounted) {
-      Navigator.pop(context);
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Compressed ZIP created and chat started in Teams!'),
-          backgroundColor: const Color(0xFF10B981),
-        ),
-      );
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Dialog(
-      backgroundColor: const Color(0xFF1E1E24),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-      child: Container(
-        width: 400,
-        padding: const EdgeInsets.all(24),
-        child: _sharing ? _buildProgress() : _buildForm(),
-      ),
-    );
-  }
-
-  Widget _buildProgress() {
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        const SizedBox(height: 20),
-        const SizedBox(
-          width: 40,
-          height: 40,
-          child: CircularProgressIndicator(color: Color(0xFF8B5CF6)),
-        ),
-        const SizedBox(height: 24),
-        Text(
-          _status,
-          style: const TextStyle(fontFamily: 'Inter', fontSize: 13, color: Colors.white),
-        ),
-        const SizedBox(height: 20),
-      ],
-    );
-  }
-
-  Widget _buildForm() {
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Row(
-          children: [
-            Icon(
-              widget.app.platform == 'ios' ? Icons.phone_iphone : Icons.android,
-              color: widget.app.platform == 'ios' ? const Color(0xFF38BDF8) : const Color(0xFF10B981),
-              size: 20,
-            ),
-            const SizedBox(width: 8),
-            Expanded(
-              child: Text(
-                'Share ${widget.app.name}',
-                style: const TextStyle(fontFamily: 'Inter', fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white),
-                overflow: TextOverflow.ellipsis,
-              ),
-            ),
-          ],
-        ),
-        const SizedBox(height: 8),
-        Text(
-          'Bundle ID: ${widget.app.packageId}\nVersion: ${widget.app.versionName} (${widget.app.versionCode})',
-          style: const TextStyle(fontFamily: 'Courier', fontSize: 10, color: Colors.grey),
-        ),
-        const SizedBox(height: 20),
-        const Text('Recipient Email / Name', style: TextStyle(fontFamily: 'Inter', fontSize: 12, color: Color(0xFFA1A1AA))),
-        const SizedBox(height: 6),
-        TextField(
-          controller: _emailController,
-          onChanged: (val) {
-            setState(() {
-              _searchQuery = val.trim();
-            });
-          },
-          style: const TextStyle(fontFamily: 'Courier', fontSize: 12, color: Colors.white),
-          decoration: InputDecoration(
-            hintText: 'Search corporate user or email',
-            fillColor: const Color(0xFF0F0F12),
-            filled: true,
-            contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-            enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: const BorderSide(color: Color(0xFF27272A))),
-            focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: const BorderSide(color: Color(0xFF8B5CF6))),
-          ),
-        ),
-        if (_searchQuery.isNotEmpty) ...[
-          const SizedBox(height: 6),
-          Container(
-            constraints: const BoxConstraints(maxHeight: 180),
-            decoration: BoxDecoration(
-              color: const Color(0xFF0F0F12),
-              borderRadius: BorderRadius.circular(8),
-              border: Border.all(color: const Color(0xFF27272A)),
-            ),
-            child: ListView(
-              shrinkWrap: true,
-              padding: EdgeInsets.zero,
-              children: _getFilteredUsers().map((user) {
-                return ListTile(
-                  dense: true,
-                  contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-                  title: Text(user['name']!, style: const TextStyle(fontFamily: 'Inter', fontSize: 12, color: Colors.white, fontWeight: FontWeight.bold)),
-                  subtitle: Text(user['email']!, style: const TextStyle(fontFamily: 'Courier', fontSize: 10, color: Colors.grey)),
-                  onTap: () {
-                    setState(() {
-                      _emailController.text = user['email']!;
-                      _emailController.selection = TextSelection.fromPosition(TextPosition(offset: _emailController.text.length));
-                      _searchQuery = '';
-                    });
-                  },
-                );
-              }).toList(),
-            ),
-          ),
-        ],
-        const SizedBox(height: 16),
-        Container(
-          padding: const EdgeInsets.all(12),
-          decoration: BoxDecoration(
-            color: const Color(0xFF0F0F12),
-            borderRadius: BorderRadius.circular(8),
-            border: Border.all(color: const Color(0xFF27272A)),
-          ),
-          child: const Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                'Teams Share Policy Notice:',
-                style: TextStyle(fontFamily: 'Inter', fontSize: 11, fontWeight: FontWeight.bold, color: Color(0xFF38BDF8)),
-              ),
-              SizedBox(height: 6),
-              Text(
-                'Direct .ipa/.apk sharing is blocked on Teams. Tapping share starts a direct chat with the recipient, pre-fills the message details, and opens Finder with the compressed .zip archive ready for drag-and-drop.',
-                style: TextStyle(fontFamily: 'Inter', fontSize: 11, color: Color(0xFFA1A1AA), height: 1.4),
-              ),
-            ],
-          ),
-        ),
-        const SizedBox(height: 24),
-        Row(
-          mainAxisAlignment: MainAxisAlignment.end,
-          children: [
-            TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: const Text('Cancel'),
-            ),
-            const SizedBox(width: 12),
-            ElevatedButton.icon(
-              style: ElevatedButton.styleFrom(
-                backgroundColor: const Color(0xFF8B5CF6),
-                foregroundColor: Colors.white,
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-              ),
-              icon: const Icon(Icons.share_rounded, size: 14),
-              label: const Text('Share over Teams', style: TextStyle(fontFamily: 'Inter', fontWeight: FontWeight.bold)),
-              onPressed: _shareOverTeams,
-            ),
-          ],
-        ),
-      ],
-    );
-  }
-}
-
-// ==========================================
 // DEVELOPER DETAILS DIALOG WIDGET
 // ==========================================
 class AppDetailsDialogWidget extends StatelessWidget {
@@ -4603,6 +7450,7 @@ class SignedAppHistoryItem {
   final String filePath;
   final String platform;
   final String date;
+  final bool isSigned;
 
   SignedAppHistoryItem({
     required this.id,
@@ -4613,6 +7461,7 @@ class SignedAppHistoryItem {
     required this.filePath,
     required this.platform,
     required this.date,
+    this.isSigned = true,
   });
 
   Map<String, dynamic> toJson() => {
@@ -4624,6 +7473,7 @@ class SignedAppHistoryItem {
     'filePath': filePath,
     'platform': platform,
     'date': date,
+    'isSigned': isSigned,
   };
 
   factory SignedAppHistoryItem.fromJson(Map<String, dynamic> json) => SignedAppHistoryItem(
@@ -4635,6 +7485,7 @@ class SignedAppHistoryItem {
     filePath: json['filePath'] ?? '',
     platform: json['platform'] ?? '',
     date: json['date'] ?? '',
+    isSigned: json['isSigned'] ?? true,
   );
 }
 
@@ -4791,5 +7642,2461 @@ void _revealInFinder(String filePath) {
     Process.run('open', ['-R', file.path]);
   } else if (Platform.isWindows) {
     Process.run('explorer.exe', ['/select,', file.path]);
+  }
+}
+
+// ==========================================
+// OFFLINE QR CODE UTILITY WIDGET
+// ==========================================
+class QrUtilityWidget extends StatefulWidget {
+  const QrUtilityWidget({super.key});
+
+  @override
+  State<QrUtilityWidget> createState() => _QrUtilityWidgetState();
+}
+
+class _QrUtilityWidgetState extends State<QrUtilityWidget> {
+  final TextEditingController _textController = TextEditingController();
+  String _textInput = '';
+
+  String? _selectedImagePath;
+  String? _decodedText;
+  bool _isDecoding = false;
+  String? _decodeError;
+
+  @override
+  void initState() {
+    super.initState();
+    _textController.addListener(() {
+      setState(() {
+        _textInput = _textController.text;
+      });
+    });
+  }
+
+  @override
+  void dispose() {
+    _textController.dispose();
+    super.dispose();
+  }
+
+  // Clipboard actions
+  Future<void> _pasteFromClipboard() async {
+    final clipboardData = await Clipboard.getData(Clipboard.kTextPlain);
+    if (clipboardData != null && clipboardData.text != null) {
+      _textController.text = clipboardData.text!;
+    }
+  }
+
+  void _clearText() {
+    _textController.clear();
+  }
+
+  Future<void> _saveQrImage() async {
+    if (_textInput.isEmpty) return;
+    try {
+      final qrValidationResult = QrValidator.validate(
+        data: _textInput,
+        version: QrVersions.auto,
+        errorCorrectionLevel: QrErrorCorrectLevel.M,
+      );
+      if (qrValidationResult.status != QrValidationStatus.valid) {
+        throw Exception("Invalid QR parameters");
+      }
+      final painter = QrPainter.withQr(
+        qr: qrValidationResult.qrCode!,
+        eyeStyle: const QrEyeStyle(
+          eyeShape: QrEyeShape.square,
+          color: Color(0xFF000000),
+        ),
+        dataModuleStyle: const QrDataModuleStyle(
+          dataModuleShape: QrDataModuleShape.square,
+          color: Color(0xFF000000),
+        ),
+        gapless: true,
+      );
+
+      // Create a solid white background canvas to ensure easy offline scanner readability
+      final recorder = ui.PictureRecorder();
+      final canvas = Canvas(recorder, const Rect.fromLTWH(0, 0, 400, 400));
+      final bgPaint = Paint()..color = Colors.white;
+      canvas.drawRect(const Rect.fromLTWH(0, 0, 400, 400), bgPaint);
+
+      // Paint the QR code onto the white background
+      painter.paint(canvas, const Size(400, 400));
+      final picture = recorder.endRecording();
+
+      // Export as a high-contrast PNG image
+      final img = await picture.toImage(400, 400);
+      final byteData = await img.toByteData(format: ui.ImageByteFormat.png);
+      if (byteData == null) throw Exception("Failed to generate image data");
+      final bytes = byteData.buffer.asUint8List();
+
+      final outputFilePath = await FilePicker.platform.saveFile(
+        dialogTitle: 'Save QR Code Image',
+        fileName: 'qrcode.png',
+        type: FileType.custom,
+        allowedExtensions: ['png'],
+      );
+
+      if (outputFilePath != null) {
+        final file = File(outputFilePath);
+        await file.writeAsBytes(bytes);
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('QR Code saved successfully to ${p.basename(outputFilePath)}'),
+              backgroundColor: const Color(0xFF10B981),
+            ),
+          );
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Failed to save QR Code: $e'),
+            backgroundColor: const Color(0xFFEF4444),
+          ),
+        );
+      }
+    }
+  }
+
+  // QR Decoding actions
+  Future<void> _pickAndDecodeQrImage() async {
+    try {
+      final result = await FilePicker.platform.pickFiles(
+        type: FileType.custom,
+        allowedExtensions: ['png', 'jpg', 'jpeg'],
+      );
+
+      if (result == null || result.files.single.path == null) {
+        return;
+      }
+
+      final filePath = result.files.single.path!;
+
+      setState(() {
+        _selectedImagePath = filePath;
+        _isDecoding = true;
+        _decodedText = null;
+        _decodeError = null;
+      });
+
+      // Run decoding in isolate to keep UI butter smooth
+      final decoded = await compute(_decodeQrIsolate, filePath);
+
+      setState(() {
+        _isDecoding = false;
+        if (decoded != null) {
+          _decodedText = decoded;
+        } else {
+          _decodeError = "No valid QR code was detected in the selected image. Please make sure the image is high resolution, centered, and has high contrast.";
+        }
+      });
+    } catch (e) {
+      setState(() {
+        _isDecoding = false;
+        _decodeError = "Error reading image file: $e";
+      });
+    }
+  }
+
+  static Future<String?> _decodeQrIsolate(String filePath) async {
+    try {
+      final file = File(filePath);
+      if (!await file.exists()) return null;
+      final bytes = await file.readAsBytes();
+      final image = img.decodeImage(bytes);
+      if (image == null) return null;
+
+      final width = image.width;
+      final height = image.height;
+      final pixels = Int32List(width * height);
+      int idx = 0;
+      for (final pixel in image) {
+        final r = pixel.r.toInt();
+        final g = pixel.g.toInt();
+        final b = pixel.b.toInt();
+        final a = pixel.a.toInt();
+        // ARGB color integer formatting
+        final argb = (a << 24) | (r << 16) | (g << 8) | b;
+        pixels[idx++] = argb;
+      }
+
+      final source = RGBLuminanceSource(width, height, pixels);
+      final bitmap = BinaryBitmap(HybridBinarizer(source));
+      final reader = QRCodeReader();
+      final decodedResult = reader.decode(bitmap);
+      return decodedResult.text;
+    } catch (e) {
+      debugPrint("QR decoding failed in isolate: $e");
+      return null;
+    }
+  }
+
+  void _clearImageSection() {
+    setState(() {
+      _selectedImagePath = null;
+      _decodedText = null;
+      _decodeError = null;
+      _isDecoding = false;
+    });
+  }
+
+  Future<void> _copyDecodedToClipboard() async {
+    if (_decodedText != null) {
+      await Clipboard.setData(ClipboardData(text: _decodedText!));
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Decoded text copied to clipboard!'),
+            backgroundColor: Color(0xFF10B981),
+            duration: Duration(seconds: 2),
+          ),
+        );
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFF0F0F11),
+      body: SingleChildScrollView(
+        child: Padding(
+          padding: const EdgeInsets.all(24.0),
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              final isWide = constraints.maxWidth >= 950;
+              return isWide
+                  ? Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Expanded(child: _buildTextToQrPanel()),
+                        const SizedBox(width: 24),
+                        Expanded(child: _buildQrToTextPanel()),
+                      ],
+                    )
+                  : Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        _buildTextToQrPanel(),
+                        const SizedBox(height: 24),
+                        _buildQrToTextPanel(),
+                      ],
+                    );
+            },
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTextToQrPanel() {
+    return Container(
+      padding: const EdgeInsets.all(24.0),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1E1E22),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: const Color(0xFF27272A), width: 1),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: const [
+              Icon(Icons.qr_code_2_rounded, color: Color(0xFF8B5CF6), size: 24),
+              SizedBox(width: 10),
+              Text(
+                'Text to QR Code',
+                style: TextStyle(
+                  fontFamily: 'Inter',
+                  fontSize: 16,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.white,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          const Text(
+            'Write or paste text content to generate a scannable QR Code image.',
+            style: TextStyle(
+              fontFamily: 'Inter',
+              fontSize: 12,
+              color: Color(0xFFA1A1AA),
+            ),
+          ),
+          const SizedBox(height: 20),
+          TextField(
+            controller: _textController,
+            maxLines: 5,
+            style: const TextStyle(fontFamily: 'Courier', fontSize: 13, color: Colors.white),
+            decoration: InputDecoration(
+              hintText: 'Enter text, URL, metadata or payload here...',
+              hintStyle: const TextStyle(color: Color(0xFF52525B)),
+              fillColor: const Color(0xFF0F0F12),
+              filled: true,
+              contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+              enabledBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(8),
+                borderSide: const BorderSide(color: Color(0xFF27272A)),
+              ),
+              focusedBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(8),
+                borderSide: const BorderSide(color: Color(0xFF8B5CF6)),
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              OutlinedButton.icon(
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: Colors.white,
+                  side: const BorderSide(color: Color(0xFF27272A)),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                ),
+                icon: const Icon(Icons.paste_rounded, size: 14),
+                label: const Text('Paste Text', style: TextStyle(fontFamily: 'Inter', fontSize: 12)),
+                onPressed: _pasteFromClipboard,
+              ),
+              const SizedBox(width: 8),
+              TextButton.icon(
+                style: TextButton.styleFrom(
+                  foregroundColor: const Color(0xFFEF4444),
+                ),
+                icon: const Icon(Icons.clear_rounded, size: 14),
+                label: const Text('Clear', style: TextStyle(fontFamily: 'Inter', fontSize: 12)),
+                onPressed: _clearText,
+              ),
+            ],
+          ),
+          const SizedBox(height: 24),
+          const Divider(color: Color(0xFF27272A), height: 1),
+          const SizedBox(height: 24),
+          Center(
+            child: _textInput.trim().isEmpty
+                ? Container(
+                    height: 220,
+                    width: double.infinity,
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF0F0F12),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(
+                        color: const Color(0xFF27272A),
+                        style: BorderStyle.solid,
+                      ),
+                    ),
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: const [
+                        Icon(Icons.qr_code_scanner_rounded, size: 36, color: Color(0xFF52525B)),
+                        SizedBox(height: 12),
+                        Text(
+                          'Awaiting text input...',
+                          style: TextStyle(
+                            fontFamily: 'Inter',
+                            fontSize: 12,
+                            color: Color(0xFF52525B),
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ],
+                    ),
+                  )
+                : Column(
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.all(16),
+                        decoration: BoxDecoration(
+                          color: Colors.white,
+                          borderRadius: BorderRadius.circular(16),
+                          boxShadow: [
+                            BoxShadow(
+                              color: Colors.black.withValues(alpha: 0.4),
+                              blurRadius: 12,
+                              offset: const Offset(0, 4),
+                            ),
+                          ],
+                        ),
+                        child: QrImageView(
+                          data: _textInput,
+                          version: QrVersions.auto,
+                          size: 180,
+                          gapless: true,
+                          errorCorrectionLevel: QrErrorCorrectLevel.M,
+                          embeddedImageStyle: const QrEmbeddedImageStyle(
+                            size: Size(30, 30),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 18),
+                      ElevatedButton.icon(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: const Color(0xFF8B5CF6),
+                          foregroundColor: Colors.white,
+                          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                        ),
+                        icon: const Icon(Icons.download_rounded, size: 14),
+                        label: const Text(
+                          'Save QR Image',
+                          style: TextStyle(fontFamily: 'Inter', fontWeight: FontWeight.bold, fontSize: 13),
+                        ),
+                        onPressed: _saveQrImage,
+                      ),
+                    ],
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildQrToTextPanel() {
+    return Container(
+      padding: const EdgeInsets.all(24.0),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1E1E22),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: const Color(0xFF27272A), width: 1),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: const [
+              Icon(Icons.image_search_rounded, color: Color(0xFF10B981), size: 24),
+              SizedBox(width: 10),
+              Text(
+                'QR Code to Text',
+                style: TextStyle(
+                  fontFamily: 'Inter',
+                  fontSize: 16,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.white,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          const Text(
+            'Upload a QR Code image file to decode and extract its original text content.',
+            style: TextStyle(
+              fontFamily: 'Inter',
+              fontSize: 12,
+              color: Color(0xFFA1A1AA),
+            ),
+          ),
+          const SizedBox(height: 20),
+          InkWell(
+            onTap: _isDecoding ? null : _pickAndDecodeQrImage,
+            borderRadius: BorderRadius.circular(12),
+            child: Container(
+              height: 220,
+              width: double.infinity,
+              decoration: BoxDecoration(
+                color: const Color(0xFF0F0F12),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(
+                  color: _selectedImagePath != null ? const Color(0xFF10B981) : const Color(0xFF27272A),
+                  width: 1.5,
+                ),
+              ),
+              child: _selectedImagePath == null
+                  ? Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: const [
+                        Icon(Icons.cloud_upload_outlined, size: 36, color: Color(0xFF71717A)),
+                        SizedBox(height: 12),
+                        Text(
+                          'Upload QR Code Image',
+                          style: TextStyle(
+                            fontFamily: 'Inter',
+                            fontSize: 13,
+                            color: Colors.white,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        SizedBox(height: 4),
+                        Text(
+                          'Supports PNG, JPG, JPEG',
+                          style: TextStyle(
+                            fontFamily: 'Inter',
+                            fontSize: 11,
+                            color: Color(0xFF52525B),
+                          ),
+                        ),
+                      ],
+                    )
+                  : Padding(
+                      padding: const EdgeInsets.all(16.0),
+                      child: Column(
+                        children: [
+                          Expanded(
+                            child: ClipRRect(
+                              borderRadius: BorderRadius.circular(8),
+                              child: Image.file(
+                                File(_selectedImagePath!),
+                                fit: BoxFit.contain,
+                              ),
+                            ),
+                          ),
+                          const SizedBox(height: 10),
+                          Text(
+                            p.basename(_selectedImagePath!),
+                            style: const TextStyle(
+                              fontFamily: 'Courier',
+                              fontSize: 11,
+                              color: Color(0xFFA1A1AA),
+                            ),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ],
+                      ),
+                    ),
+            ),
+          ),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              OutlinedButton.icon(
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: Colors.white,
+                  side: const BorderSide(color: Color(0xFF27272A)),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                ),
+                icon: const Icon(Icons.file_open_rounded, size: 14),
+                label: Text(
+                  _selectedImagePath == null ? 'Select Image' : 'Change Image',
+                  style: const TextStyle(fontFamily: 'Inter', fontSize: 12),
+                ),
+                onPressed: _isDecoding ? null : _pickAndDecodeQrImage,
+              ),
+              if (_selectedImagePath != null) ...[
+                const SizedBox(width: 8),
+                TextButton.icon(
+                  style: TextButton.styleFrom(
+                    foregroundColor: const Color(0xFFEF4444),
+                  ),
+                  icon: const Icon(Icons.delete_outline_rounded, size: 14),
+                  label: const Text('Clear', style: TextStyle(fontFamily: 'Inter', fontSize: 12)),
+                  onPressed: _clearImageSection,
+                ),
+              ],
+            ],
+          ),
+          const SizedBox(height: 24),
+          const Divider(color: Color(0xFF27272A), height: 1),
+          const SizedBox(height: 24),
+          if (_isDecoding)
+            Center(
+              child: Column(
+                children: const [
+                  SizedBox(height: 20),
+                  SizedBox(
+                    width: 28,
+                    height: 28,
+                    child: CircularProgressIndicator(color: Color(0xFF10B981), strokeWidth: 2),
+                  ),
+                  SizedBox(height: 14),
+                  Text(
+                    'Decoding QR Image...',
+                    style: TextStyle(
+                      fontFamily: 'Inter',
+                      fontSize: 12,
+                      color: Color(0xFFA1A1AA),
+                    ),
+                  ),
+                  SizedBox(height: 20),
+                ],
+              ),
+            )
+          else if (_decodedText != null)
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    const Text(
+                      'Decoded Text Payload:',
+                      style: TextStyle(
+                        fontFamily: 'Inter',
+                        fontSize: 12,
+                        fontWeight: FontWeight.bold,
+                        color: Color(0xFF10B981),
+                      ),
+                    ),
+                    ElevatedButton.icon(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFF10B981),
+                        foregroundColor: Colors.white,
+                        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+                      ),
+                      icon: const Icon(Icons.copy_rounded, size: 12),
+                      label: const Text('Copy', style: TextStyle(fontFamily: 'Inter', fontSize: 11, fontWeight: FontWeight.bold)),
+                      onPressed: _copyDecodedToClipboard,
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF0F0F12),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: const Color(0xFF27272A)),
+                  ),
+                  constraints: const BoxConstraints(maxHeight: 120),
+                  child: SingleChildScrollView(
+                    child: SelectableText(
+                      _decodedText!,
+                      style: const TextStyle(
+                        fontFamily: 'Courier',
+                        fontSize: 12,
+                        color: Colors.white,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            )
+          else if (_decodeError != null)
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: const Color(0xFF2D1414),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: const Color(0xFFEF4444).withValues(alpha: 0.5)),
+              ),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Icon(Icons.error_outline_rounded, color: Color(0xFFEF4444), size: 18),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      _decodeError!,
+                      style: const TextStyle(
+                        fontFamily: 'Inter',
+                        fontSize: 12,
+                        color: Color(0xFFFCA5A5),
+                        height: 1.4,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            )
+          else
+            Container(
+              height: 80,
+              width: double.infinity,
+              decoration: BoxDecoration(
+                color: const Color(0xFF0F0F12),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: const Color(0xFF27272A)),
+              ),
+              child: const Center(
+                child: Text(
+                  'No QR image uploaded yet.',
+                  style: TextStyle(
+                    fontFamily: 'Inter',
+                    fontSize: 12,
+                    color: Color(0xFF52525B),
+                  ),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+// ==========================================
+// CENTRAL DATABASE MANAGEMENT & MODELS
+// ==========================================
+class CentralDatabase {
+  static File _getDatabaseFile() {
+    return File('/Users/pavanyadav/.gemini/antigravity-ide/scratch/sign_next_central_db.json');
+  }
+
+  static Future<Map<String, dynamic>> _readDb() async {
+    final file = _getDatabaseFile();
+    if (!await file.exists()) {
+      final initialData = {
+        "parent_emails": ["pavan.yadav@businessnext.com"],
+        "child_users": {},
+        "audit_logs": [],
+        "alerts": [],
+        "global_certificates": []
+      };
+      try {
+        await file.create(recursive: true);
+        await file.writeAsString(json.encode(initialData), flush: true);
+      } catch (_) {}
+      return initialData;
+    }
+
+    try {
+      final content = await file.readAsString();
+      if (content.trim().isEmpty) {
+        throw const FormatException("Empty file");
+      }
+      return json.decode(content) as Map<String, dynamic>;
+    } catch (_) {
+      final initialData = {
+        "parent_emails": ["pavan.yadav@businessnext.com"],
+        "child_users": {},
+        "audit_logs": [],
+        "alerts": [],
+        "global_certificates": []
+      };
+      try {
+        await file.writeAsString(json.encode(initialData), flush: true);
+      } catch (_) {}
+      return initialData;
+    }
+  }
+
+  static Future<void> _writeDb(Map<String, dynamic> data) async {
+    final file = _getDatabaseFile();
+    try {
+      await file.writeAsString(json.encode(data), flush: true);
+    } catch (_) {}
+  }
+
+  static Future<List<String>> getParentEmails() async {
+    final db = await _readDb();
+    final list = db['parent_emails'] as List?;
+    if (list == null) return ["pavan.yadav@businessnext.com"];
+    final emails = list.map((e) => e.toString()).toList();
+    if (!emails.contains("pavan.yadav@businessnext.com")) {
+      emails.add("pavan.yadav@businessnext.com");
+    }
+    return emails;
+  }
+
+  static Future<void> addParentEmail(String email) async {
+    final db = await _readDb();
+    final list = List<String>.from(db['parent_emails'] ?? ["pavan.yadav@businessnext.com"]);
+    if (!list.contains(email)) {
+      list.add(email);
+      db['parent_emails'] = list;
+      await _writeDb(db);
+    }
+  }
+
+  static Future<void> removeParentEmail(String email) async {
+    if (email == "pavan.yadav@businessnext.com") return;
+    final db = await _readDb();
+    final list = List<String>.from(db['parent_emails'] ?? ["pavan.yadav@businessnext.com"]);
+    if (list.contains(email)) {
+      list.remove(email);
+      db['parent_emails'] = list;
+      await _writeDb(db);
+    }
+  }
+
+  static Future<Map<String, dynamic>> getChildUsers() async {
+    final db = await _readDb();
+    return db['child_users'] as Map<String, dynamic>? ?? {};
+  }
+
+  static Future<void> updateChildUser(
+    String email, {
+    String? role,
+    String? status,
+    String? deviceName,
+    String? osVersion,
+  }) async {
+    final db = await _readDb();
+    final childUsers = Map<String, dynamic>.from(db['child_users'] ?? {});
+    final userData = Map<String, dynamic>.from(childUsers[email] ?? {});
+
+    if (role != null) userData['role'] = role;
+    if (status != null) userData['status'] = status;
+    if (deviceName != null) userData['deviceName'] = deviceName;
+    if (osVersion != null) userData['osVersion'] = osVersion;
+    userData['lastActive'] = DateTime.now().toIso8601String();
+
+    if (email == 'pavan.yadav@businessnext.com') {
+      userData['role'] = 'Role 2';
+      userData['status'] = 'Active';
+    }
+
+    userData['role'] ??= 'Role 1';
+    userData['status'] ??= 'Active';
+    userData['deviceName'] ??= 'Unknown Device';
+    userData['osVersion'] ??= 'Unknown OS';
+
+    childUsers[email] = userData;
+    db['child_users'] = childUsers;
+    await _writeDb(db);
+  }
+
+  static Future<void> logAction(
+    String email,
+    String action,
+    String details, {
+    String? deviceName,
+    String? osVersion,
+  }) async {
+    final db = await _readDb();
+    final logs = List<dynamic>.from(db['audit_logs'] ?? []);
+    logs.insert(0, {
+      "email": email,
+      "action": action,
+      "details": details,
+      "deviceName": deviceName ?? "Unknown",
+      "osVersion": osVersion ?? "Unknown",
+      "timestamp": DateTime.now().toIso8601String(),
+    });
+    if (logs.length > 200) {
+      logs.removeRange(200, logs.length);
+    }
+    db['audit_logs'] = logs;
+    await _writeDb(db);
+  }
+
+  static Future<List<Map<String, dynamic>>> getAuditLogs() async {
+    final db = await _readDb();
+    final logs = db['audit_logs'] as List?;
+    if (logs == null) return [];
+    return logs.map((l) => Map<String, dynamic>.from(l)).toList();
+  }
+
+  static Future<List<Map<String, dynamic>>> getAlertsForUser(String email) async {
+    final db = await _readDb();
+    final alerts = db['alerts'] as List?;
+    if (alerts == null) return [];
+    return alerts
+        .map((a) => Map<String, dynamic>.from(a))
+        .where((a) => a['target'] == 'All' || a['target'] == email)
+        .toList();
+  }
+
+  static Future<void> markAlertAsRead(String alertId, String email) async {
+    final db = await _readDb();
+    final alerts = List<dynamic>.from(db['alerts'] ?? []);
+    for (var i = 0; i < alerts.length; i++) {
+      final alert = Map<String, dynamic>.from(alerts[i]);
+      if (alert['id'] == alertId) {
+        final readBy = List<String>.from(alert['readBy'] ?? []);
+        if (!readBy.contains(email)) {
+          readBy.add(email);
+          alert['readBy'] = readBy;
+          alerts[i] = alert;
+        }
+      }
+    }
+    db['alerts'] = alerts;
+    await _writeDb(db);
+  }
+
+  static Future<void> sendBroadcastAlert(
+    String sender,
+    String target,
+    String priority,
+    String message,
+  ) async {
+    final db = await _readDb();
+    final alerts = List<dynamic>.from(db['alerts'] ?? []);
+    alerts.insert(0, {
+      "id": DateTime.now().millisecondsSinceEpoch.toString(),
+      "sender": sender,
+      "target": target,
+      "priority": priority,
+      "message": message,
+      "timestamp": DateTime.now().toIso8601String(),
+      "readBy": [],
+    });
+    db['alerts'] = alerts;
+    await _writeDb(db);
+  }
+
+  static Future<List<Map<String, dynamic>>> getGlobalCertificates() async {
+    final db = await _readDb();
+    final certs = db['global_certificates'] as List?;
+    if (certs == null) return [];
+    return certs.map((c) => Map<String, dynamic>.from(c)).toList();
+  }
+
+  static Future<void> addGlobalCertificate(Map<String, dynamic> cert) async {
+    final db = await _readDb();
+    final certs = List<dynamic>.from(db['global_certificates'] ?? []);
+    certs.add(cert);
+    db['global_certificates'] = certs;
+    await _writeDb(db);
+  }
+
+  static Future<void> removeGlobalCertificate(String certId) async {
+    final db = await _readDb();
+    final certs = List<dynamic>.from(db['global_certificates'] ?? []);
+    certs.removeWhere((c) => c['id'] == certId);
+    db['global_certificates'] = certs;
+    await _writeDb(db);
+  }
+}
+
+// ==========================================
+// ACCESS REVOKED RED BLOCK VIEW
+// ==========================================
+class AccessRevokedScreen extends StatelessWidget {
+  final String userEmail;
+  final VoidCallback onLogout;
+
+  const AccessRevokedScreen({
+    super.key,
+    required this.userEmail,
+    required this.onLogout,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFF0F0F11),
+      body: Center(
+        child: Container(
+          constraints: const BoxConstraints(maxWidth: 450),
+          margin: const EdgeInsets.all(24),
+          padding: const EdgeInsets.all(32),
+          decoration: BoxDecoration(
+            color: const Color(0xFF1E1E22),
+            borderRadius: BorderRadius.circular(20),
+            border: Border.all(color: const Color(0xFFEF4444).withOpacity(0.4), width: 1.5),
+            boxShadow: [
+              BoxShadow(
+                color: const Color(0xFFEF4444).withOpacity(0.15),
+                blurRadius: 30,
+                spreadRadius: 2,
+              )
+            ],
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                padding: const EdgeInsets.all(16),
+                decoration: const BoxDecoration(
+                  color: Color(0xFF2D1414),
+                  shape: BoxShape.circle,
+                ),
+                child: const Icon(
+                  Icons.gavel_rounded,
+                  color: Color(0xFFEF4444),
+                  size: 48,
+                ),
+              ),
+              const SizedBox(height: 24),
+              const Text(
+                'Access Deactivated',
+                style: TextStyle(
+                  fontFamily: 'Inter',
+                  fontSize: 22,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.white,
+                ),
+              ),
+              const SizedBox(height: 12),
+              Text(
+                'Your authorization for $userEmail has been revoked by the Parent Administration.',
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  fontFamily: 'Inter',
+                  fontSize: 13,
+                  color: Color(0xFFA1A1AA),
+                  height: 1.5,
+                ),
+              ),
+              const SizedBox(height: 24),
+              SizedBox(
+                width: double.infinity,
+                height: 48,
+                child: ElevatedButton.icon(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFFEF4444),
+                    foregroundColor: Colors.white,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                  ),
+                  icon: const Icon(Icons.logout_rounded, size: 16),
+                  label: const Text(
+                    'Return to Login Screen',
+                    style: TextStyle(
+                      fontFamily: 'Inter',
+                      fontWeight: FontWeight.bold,
+                      fontSize: 13,
+                    ),
+                  ),
+                  onPressed: onLogout,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ==========================================
+// DYNAMIC SLIDE-IN ALERT BANNER
+// ==========================================
+class SlideInAlertBanner extends StatelessWidget {
+  final Map<String, dynamic> alert;
+  final VoidCallback onDismiss;
+
+  const SlideInAlertBanner({
+    super.key,
+    required this.alert,
+    required this.onDismiss,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final priority = alert['priority'] ?? 'Low';
+    Color bannerColor = const Color(0xFF1E1E22);
+    Color accentColor = const Color(0xFF8B5CF6);
+    IconData icon = Icons.info_rounded;
+
+    if (priority == 'High') {
+      bannerColor = const Color(0xFF2D1414);
+      accentColor = const Color(0xFFEF4444);
+      icon = Icons.warning_amber_rounded;
+    } else if (priority == 'Medium') {
+      bannerColor = const Color(0xFF2D2414);
+      accentColor = const Color(0xFFF59E0B);
+      icon = Icons.error_outline_rounded;
+    }
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+      decoration: BoxDecoration(
+        color: bannerColor.withOpacity(0.9),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: accentColor.withOpacity(0.5), width: 1.5),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.5),
+            blurRadius: 16,
+            offset: const Offset(0, 8),
+          )
+        ],
+      ),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(16),
+        child: BackdropFilter(
+          filter: ui.ImageFilter.blur(sigmaX: 10, sigmaY: 10),
+          child: Row(
+            children: [
+              Icon(icon, color: accentColor, size: 24),
+              const SizedBox(width: 14),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Row(
+                      children: [
+                        Text(
+                          '$priority Priority Broadcast Alert',
+                          style: TextStyle(
+                            fontFamily: 'Inter',
+                            fontSize: 11,
+                            fontWeight: FontWeight.bold,
+                            color: accentColor,
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Text(
+                          'from ${alert['sender']}',
+                          style: const TextStyle(
+                            fontFamily: 'Inter',
+                            fontSize: 9,
+                            color: Color(0xFF71717A),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      alert['message'] ?? '',
+                      style: const TextStyle(
+                        fontFamily: 'Inter',
+                        fontSize: 13,
+                        color: Colors.white,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 14),
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: accentColor,
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                ),
+                onPressed: onDismiss,
+                child: const Text(
+                  'Dismiss',
+                  style: TextStyle(
+                    fontFamily: 'Inter',
+                    fontWeight: FontWeight.bold,
+                    fontSize: 11,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    ).animate().slideY(begin: -1, end: 0, duration: 400.ms, curve: Curves.easeOutCubic).fade(duration: 400.ms);
+  }
+}
+
+// ==========================================
+// ACCESS DENIED ERROR CONTAINER
+// ==========================================
+class AccessDeniedWidget extends StatelessWidget {
+  final String title;
+  final String message;
+
+  const AccessDeniedWidget({
+    super.key,
+    required this.title,
+    required this.message,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Container(
+        constraints: const BoxConstraints(maxWidth: 500),
+        padding: const EdgeInsets.all(32),
+        decoration: BoxDecoration(
+          color: const Color(0xFF1E1E22),
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: const Color(0xFF27272A)),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              padding: const EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                color: const Color(0xFFEF4444).withOpacity(0.1),
+                shape: BoxShape.circle,
+              ),
+              child: const Icon(
+                Icons.lock_rounded,
+                color: Color(0xFFEF4444),
+                size: 36,
+              ),
+            ),
+            const SizedBox(height: 20),
+            Text(
+              title,
+              style: const TextStyle(
+                fontFamily: 'Inter',
+                fontSize: 18,
+                fontWeight: FontWeight.bold,
+                color: Colors.white,
+              ),
+            ),
+            const SizedBox(height: 12),
+            Text(
+              message,
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                fontFamily: 'Inter',
+                fontSize: 13,
+                color: Color(0xFFA1A1AA),
+                height: 1.5,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+enum ParentTab { users, certs, alerts, logs }
+
+// ==========================================
+// PARENT DASHBOARD CONTROL CENTER WIDGET
+// ==========================================
+class ParentDashboardWidget extends StatefulWidget {
+  final String userEmail;
+  final VoidCallback onLogout;
+  final VoidCallback? onSwitchToChild;
+
+  const ParentDashboardWidget({
+    super.key,
+    required this.userEmail,
+    required this.onLogout,
+    this.onSwitchToChild,
+  });
+
+  @override
+  State<ParentDashboardWidget> createState() => _ParentDashboardWidgetState();
+}
+
+class _ParentDashboardWidgetState extends State<ParentDashboardWidget> {
+  ParentTab _currentTab = ParentTab.users;
+
+  Timer? _refreshTimer;
+
+  Map<String, dynamic> _childUsers = {};
+  List<String> _parentEmails = [];
+  List<Map<String, dynamic>> _auditLogs = [];
+  List<Map<String, dynamic>> _globalCerts = [];
+
+  final _parentEmailController = TextEditingController();
+
+  String _certPlatform = 'ios';
+  final _certNameController = TextEditingController();
+  final _p12PathController = TextEditingController();
+  final _p12PasswordController = TextEditingController();
+  final _provPathController = TextEditingController();
+  final _keychainPasswordController = TextEditingController();
+  final _identityController = TextEditingController();
+
+  final _keystorePathController = TextEditingController();
+  final _keyAliasController = TextEditingController();
+  final _keyPasswordController = TextEditingController();
+  final _storePasswordController = TextEditingController();
+
+  String _alertTarget = 'All';
+  String _alertPriority = 'High';
+  final _alertMessageController = TextEditingController();
+
+  @override
+  void initState() {
+    super.initState();
+    _refreshData();
+    _refreshTimer = Timer.periodic(const Duration(seconds: 2), (timer) {
+      _refreshData();
+    });
+  }
+
+  @override
+  void dispose() {
+    _refreshTimer?.cancel();
+    _parentEmailController.dispose();
+    _certNameController.dispose();
+    _p12PathController.dispose();
+    _p12PasswordController.dispose();
+    _provPathController.dispose();
+    _keychainPasswordController.dispose();
+    _identityController.dispose();
+    _keystorePathController.dispose();
+    _keyAliasController.dispose();
+    _keyPasswordController.dispose();
+    _storePasswordController.dispose();
+    _alertMessageController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _refreshData() async {
+    final parentEmails = await CentralDatabase.getParentEmails();
+    final childUsers = await CentralDatabase.getChildUsers();
+    final auditLogs = await CentralDatabase.getAuditLogs();
+    final globalCerts = await CentralDatabase.getGlobalCertificates();
+
+    if (mounted) {
+      setState(() {
+        _parentEmails = parentEmails;
+        _childUsers = childUsers;
+        _auditLogs = auditLogs;
+        _globalCerts = globalCerts;
+      });
+    }
+  }
+
+  Future<void> _addParentEmail() async {
+    final email = _parentEmailController.text.trim();
+    if (email.isEmpty || !email.contains('@')) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Please enter a valid email address.')),
+      );
+      return;
+    }
+    await CentralDatabase.addParentEmail(email);
+    _parentEmailController.clear();
+    _refreshData();
+  }
+
+  Future<void> _removeParentEmail(String email) async {
+    if (email == 'pavan.yadav@businessnext.com') {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Cannot remove primary parent admin.')),
+      );
+      return;
+    }
+    await CentralDatabase.removeParentEmail(email);
+    _refreshData();
+  }
+
+  Future<void> _toggleChildRole(String email, String currentRole) async {
+    final newRole = currentRole == 'Role 1' ? 'Role 2' : 'Role 1';
+    await CentralDatabase.updateChildUser(email, role: newRole);
+    _refreshData();
+  }
+
+  Future<void> _toggleChildStatus(String email, String currentStatus) async {
+    final newStatus = currentStatus == 'Active' ? 'Revoked' : 'Active';
+    await CentralDatabase.updateChildUser(email, status: newStatus);
+    _refreshData();
+  }
+
+  Future<void> _addParentEmailFromList(String email) async {
+    await CentralDatabase.addParentEmail(email);
+    _refreshData();
+  }
+
+  Future<void> _pickPath(TextEditingController controller, String type) async {
+    FilePickerResult? result;
+    List<String>? extensions;
+    if (type == 'p12') extensions = ['p12'];
+    else if (type == 'mobileprovision') extensions = ['mobileprovision'];
+    else if (type == 'keystore') extensions = ['keystore', 'jks', 'pfx'];
+
+    result = await FilePicker.platform.pickFiles(
+      type: extensions != null ? FileType.custom : FileType.any,
+      allowedExtensions: extensions,
+    );
+    if (result != null && result.files.single.path != null) {
+      controller.text = result.files.single.path!;
+    }
+  }
+
+  Future<void> _publishGlobalCertificate() async {
+    final name = _certNameController.text.trim();
+    if (name.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Please enter certificate name.')),
+      );
+      return;
+    }
+
+    final newCert = <String, dynamic>{
+      'id': DateTime.now().millisecondsSinceEpoch.toString(),
+      'name': name,
+      'platform': _certPlatform,
+    };
+
+    if (_certPlatform == 'ios') {
+      if (_p12PathController.text.isEmpty || _provPathController.text.isEmpty || _identityController.text.isEmpty) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Please fill all required iOS certificate fields.')),
+        );
+        return;
+      }
+      newCert['p12Path'] = _p12PathController.text.trim();
+      newCert['p12Password'] = _p12PasswordController.text.trim();
+      newCert['provPath'] = _provPathController.text.trim();
+      newCert['keychainPassword'] = _keychainPasswordController.text.trim();
+      newCert['identity'] = _identityController.text.trim();
+    } else {
+      if (_keystorePathController.text.isEmpty || _keyAliasController.text.isEmpty || _keyPasswordController.text.isEmpty || _storePasswordController.text.isEmpty) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Please fill all required Android keystore fields.')),
+        );
+        return;
+      }
+      newCert['keystorePath'] = _keystorePathController.text.trim();
+      newCert['keyAlias'] = _keyAliasController.text.trim();
+      newCert['keyPassword'] = _keyPasswordController.text.trim();
+      newCert['storePassword'] = _storePasswordController.text.trim();
+    }
+
+    await CentralDatabase.addGlobalCertificate(newCert);
+
+    _certNameController.clear();
+    _p12PathController.clear();
+    _p12PasswordController.clear();
+    _provPathController.clear();
+    _keychainPasswordController.clear();
+    _identityController.clear();
+    _keystorePathController.clear();
+    _keyAliasController.clear();
+    _keyPasswordController.clear();
+    _storePasswordController.clear();
+
+    _refreshData();
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Global Certificate published successfully!')),
+    );
+  }
+
+  Future<void> _removeGlobalCertificate(String id) async {
+    await CentralDatabase.removeGlobalCertificate(id);
+    _refreshData();
+  }
+
+  Future<void> _sendAlert() async {
+    final msg = _alertMessageController.text.trim();
+    if (msg.isEmpty) return;
+
+    await CentralDatabase.sendBroadcastAlert(
+      widget.userEmail,
+      _alertTarget,
+      _alertPriority,
+      msg,
+    );
+
+    _alertMessageController.clear();
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Broadcast Alert sent successfully!')),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Row(
+        children: [
+          _buildSidebar(),
+          Expanded(
+            child: Container(
+              color: const Color(0xFF09090B),
+              child: SafeArea(
+                child: Column(
+                  children: [
+                    _buildTopBar(),
+                    Expanded(
+                      child: Padding(
+                        padding: const EdgeInsets.all(24.0),
+                        child: AnimatedSwitcher(
+                          duration: const Duration(milliseconds: 250),
+                          child: _buildCurrentTabContent(),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSidebar() {
+    return Container(
+      width: 250,
+      decoration: const BoxDecoration(
+        color: Color(0xFF0F0F12),
+        border: Border(right: BorderSide(color: Color(0xFF27272A), width: 1)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Padding(
+            padding: const EdgeInsets.only(top: 32.0, left: 24.0, bottom: 20.0),
+            child: Row(
+              children: [
+                Container(
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    gradient: const LinearGradient(
+                      colors: [Color(0xFFEF4444), Color(0xFFF59E0B)],
+                    ),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: const Icon(Icons.admin_panel_settings_rounded, color: Colors.white, size: 28),
+                ),
+                const SizedBox(width: 14),
+                const Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Parent Hub',
+                      style: TextStyle(
+                        fontFamily: 'Inter',
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                        color: Colors.white,
+                      ),
+                    ),
+                    Text(
+                      'Control Center',
+                      style: TextStyle(
+                        fontFamily: 'Inter',
+                        fontSize: 11,
+                        color: Color(0xFF71717A),
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
+            child: Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: const Color(0xFF1E1E22),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: const Color(0xFF27272A)),
+              ),
+              child: Row(
+                children: [
+                  CircleAvatar(
+                    backgroundColor: const Color(0xFFEF4444),
+                    radius: 14,
+                    child: const Icon(Icons.shield_rounded, color: Colors.white, size: 14),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          'Enterprise Admin',
+                          style: TextStyle(
+                            fontFamily: 'Inter',
+                            fontSize: 10,
+                            color: Color(0xFFEF4444),
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        Text(
+                          widget.userEmail,
+                          style: const TextStyle(
+                            fontFamily: 'Inter',
+                            fontSize: 10,
+                            color: Colors.white70,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.logout_rounded, size: 14, color: Color(0xFFEF4444)),
+                    tooltip: 'Logout',
+                    constraints: const BoxConstraints(),
+                    padding: EdgeInsets.zero,
+                    onPressed: widget.onLogout,
+                  ),
+                ],
+              ),
+            ),
+          ),
+          if (widget.onSwitchToChild != null) ...[
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 4.0),
+              child: SizedBox(
+                width: double.infinity,
+                child: InkWell(
+                  onTap: widget.onSwitchToChild,
+                  borderRadius: BorderRadius.circular(8),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(vertical: 10),
+                    decoration: BoxDecoration(
+                      gradient: const LinearGradient(
+                        colors: [Color(0xFF8B5CF6), Color(0xFF10B981)],
+                      ),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: const Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Icon(Icons.swap_horiz_rounded, color: Colors.white, size: 14),
+                        SizedBox(width: 8),
+                        Text(
+                          'Switch to Child Workspace',
+                          style: TextStyle(
+                            fontFamily: 'Inter',
+                            fontSize: 11,
+                            fontWeight: FontWeight.bold,
+                            color: Colors.white,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ],
+          const Divider(color: Color(0xFF27272A), height: 16),
+          _buildSidebarItem(tab: ParentTab.users, icon: Icons.people_rounded, label: 'Signers & Admins', subtitle: 'Manage roles and status'),
+          _buildSidebarItem(tab: ParentTab.certs, icon: Icons.vpn_key_rounded, label: 'Global Certificates', subtitle: 'Distribute code keys'),
+          _buildSidebarItem(tab: ParentTab.alerts, icon: Icons.campaign_rounded, label: 'Alert Broadcasts', subtitle: 'Push alerts to devices'),
+          _buildSidebarItem(tab: ParentTab.logs, icon: Icons.analytics_outlined, label: 'Audit Activity', subtitle: 'Real-time actions logs'),
+          const Spacer(),
+          Padding(
+            padding: const EdgeInsets.all(24.0),
+            child: Center(
+              child: Text(
+                'v1.0.0 • BusinessNext',
+                style: TextStyle(fontFamily: 'Inter', fontSize: 11, color: Colors.grey[600]),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSidebarItem({required ParentTab tab, required IconData icon, required String label, required String subtitle}) {
+    final isSelected = _currentTab == tab;
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 12.0, vertical: 4.0),
+      child: InkWell(
+        onTap: () => setState(() => _currentTab = tab),
+        borderRadius: BorderRadius.circular(10),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 12.0),
+          decoration: BoxDecoration(
+            color: isSelected ? const Color(0xFF1E1E24) : Colors.transparent,
+            borderRadius: BorderRadius.circular(10),
+            border: isSelected ? Border.all(color: const Color(0xFF27272A), width: 1) : Border.all(color: Colors.transparent, width: 1),
+          ),
+          child: Row(
+            children: [
+              Icon(icon, color: isSelected ? const Color(0xFFEF4444) : const Color(0xFF71717A), size: 22),
+              const SizedBox(width: 16),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      label,
+                      style: TextStyle(
+                        fontFamily: 'Inter',
+                        fontSize: 13,
+                        fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+                        color: isSelected ? Colors.white : const Color(0xFFA1A1AA),
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      subtitle,
+                      style: TextStyle(
+                        fontFamily: 'Inter',
+                        fontSize: 11,
+                        color: isSelected ? const Color(0xFF71717A) : const Color(0xFF52525B),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTopBar() {
+    String title = '';
+    String desc = '';
+    switch (_currentTab) {
+      case ParentTab.users:
+        title = 'Signers & Devices';
+        desc = 'Monitor client installations, toggle roles (Role 1 ↔ Role 2), and revoke access.';
+        break;
+      case ParentTab.certs:
+        title = 'Global Distributed Certificates';
+        desc = 'Deploy signing credentials that Role 1 users can use without credential access.';
+        break;
+      case ParentTab.alerts:
+        title = 'Safety Alerts Broadcast';
+        desc = 'Push glassmorphic animated alerts to active child workspace devices.';
+        break;
+      case ParentTab.logs:
+        title = 'Audit Activity Logs';
+        desc = 'Real-time trace logs of all signing, unsigning, and workspace actions.';
+        break;
+    }
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 24.0, vertical: 16.0),
+      decoration: const BoxDecoration(
+        color: Color(0xFF0F0F12),
+        border: Border(bottom: BorderSide(color: Color(0xFF27272A), width: 1)),
+      ),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                title,
+                style: const TextStyle(fontFamily: 'Inter', fontSize: 20, fontWeight: FontWeight.bold, color: Colors.white),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                desc,
+                style: const TextStyle(fontFamily: 'Inter', fontSize: 13, color: Color(0xFF71717A)),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildCurrentTabContent() {
+    switch (_currentTab) {
+      case ParentTab.users:
+        return _buildUsersTab();
+      case ParentTab.certs:
+        return _buildCertsTab();
+      case ParentTab.alerts:
+        return _buildAlertsTab();
+      case ParentTab.logs:
+        return _buildLogsTab();
+    }
+  }
+
+  Widget _buildUsersTab() {
+    final bool isCurrentUserSuperAdmin = widget.userEmail == 'pavan.yadav@businessnext.com';
+
+    return SingleChildScrollView(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(
+                flex: isCurrentUserSuperAdmin ? 3 : 1,
+                child: Container(
+                  padding: const EdgeInsets.all(20),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF1E1E22),
+                    borderRadius: BorderRadius.circular(16),
+                    border: Border.all(color: const Color(0xFF27272A)),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        'Registered Workspace Signers',
+                        style: TextStyle(fontFamily: 'Inter', fontSize: 14, fontWeight: FontWeight.bold, color: Color(0xFFEF4444)),
+                      ),
+                      const SizedBox(height: 16),
+                      if (_childUsers.isEmpty)
+                        const Padding(
+                          padding: EdgeInsets.symmetric(vertical: 24),
+                          child: Center(
+                            child: Text(
+                              'No child signers registered yet.',
+                              style: TextStyle(fontFamily: 'Inter', fontSize: 13, color: Color(0xFF52525B)),
+                            ),
+                          ),
+                        )
+                      else
+                        ListView.separated(
+                          shrinkWrap: true,
+                          physics: const NeverScrollableScrollPhysics(),
+                          itemCount: _childUsers.length,
+                          separatorBuilder: (context, index) => const Divider(color: Color(0xFF27272A), height: 24),
+                          itemBuilder: (context, index) {
+                            final email = _childUsers.keys.elementAt(index);
+                            final data = _childUsers[email] as Map<String, dynamic>;
+                            final role = data['role'] ?? 'Role 1';
+                            final status = data['status'] ?? 'Active';
+                            final isRevoked = status == 'Revoked';
+                            final bool isRowUserSuperAdmin = email == 'pavan.yadav@businessnext.com';
+                            final bool isUserAdmin = _parentEmails.contains(email);
+
+                            return Row(
+                              children: [
+                                CircleAvatar(
+                                  backgroundColor: isRevoked ? const Color(0xFFEF4444).withOpacity(0.2) : const Color(0xFF10B981).withOpacity(0.2),
+                                  radius: 18,
+                                  child: Icon(
+                                    isRevoked ? Icons.gavel_rounded : Icons.person_rounded,
+                                    color: isRevoked ? const Color(0xFFEF4444) : const Color(0xFF10B981),
+                                    size: 16,
+                                  ),
+                                ),
+                                const SizedBox(width: 14),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        email,
+                                        style: const TextStyle(fontFamily: 'Inter', fontSize: 13, fontWeight: FontWeight.bold, color: Colors.white),
+                                      ),
+                                      const SizedBox(height: 2),
+                                      Text(
+                                        'Device: ${data['deviceName']} • OS: ${data['osVersion']}',
+                                        style: const TextStyle(fontFamily: 'Inter', fontSize: 11, color: Color(0xFF71717A)),
+                                      ),
+                                      const SizedBox(height: 2),
+                                      Text(
+                                        'Last Active: ${data['lastActive'] != null ? data['lastActive'].toString().replaceAll("T", " ").substring(0, 19) : ""}',
+                                        style: const TextStyle(fontFamily: 'Courier', fontSize: 10, color: Color(0xFF52525B)),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                Column(
+                                  crossAxisAlignment: CrossAxisAlignment.end,
+                                  children: [
+                                    Row(
+                                      children: [
+                                        if (isCurrentUserSuperAdmin && !isRowUserSuperAdmin) ...[
+                                          ElevatedButton(
+                                            style: ElevatedButton.styleFrom(
+                                              backgroundColor: isUserAdmin ? const Color(0xFFF59E0B) : const Color(0xFF10B981),
+                                              foregroundColor: Colors.white,
+                                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+                                            ),
+                                            onPressed: () {
+                                              if (isUserAdmin) {
+                                                _removeParentEmail(email);
+                                              } else {
+                                                _addParentEmailFromList(email);
+                                              }
+                                            },
+                                            child: Text(
+                                              isUserAdmin ? 'Demote to Child' : 'Promote to Admin',
+                                              style: const TextStyle(fontFamily: 'Inter', fontSize: 10, fontWeight: FontWeight.bold),
+                                            ),
+                                          ),
+                                          const SizedBox(width: 8),
+                                        ],
+                                        // Role button
+                                        if (isCurrentUserSuperAdmin && !isRowUserSuperAdmin)
+                                          ElevatedButton(
+                                            style: ElevatedButton.styleFrom(
+                                              backgroundColor: role == 'Role 1' ? const Color(0xFF27272A) : const Color(0xFF8B5CF6),
+                                              foregroundColor: Colors.white,
+                                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+                                            ),
+                                            onPressed: () => _toggleChildRole(email, role),
+                                            child: Text(
+                                              role == 'Role 1' ? 'Standard (Role 1)' : 'Admin (Role 2)',
+                                              style: const TextStyle(fontFamily: 'Inter', fontSize: 10, fontWeight: FontWeight.bold),
+                                            ),
+                                          )
+                                        else
+                                          Container(
+                                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                                            decoration: BoxDecoration(
+                                              color: isRowUserSuperAdmin 
+                                                  ? const Color(0xFFF59E0B).withOpacity(0.15)
+                                                  : (role == 'Role 1' ? const Color(0xFF27272A) : const Color(0xFF8B5CF6).withOpacity(0.15)),
+                                              borderRadius: BorderRadius.circular(6),
+                                              border: Border.all(
+                                                color: isRowUserSuperAdmin 
+                                                    ? const Color(0xFFF59E0B) 
+                                                    : (role == 'Role 1' ? const Color(0xFF3F3F46) : const Color(0xFF8B5CF6)),
+                                              ),
+                                            ),
+                                            child: Text(
+                                              isRowUserSuperAdmin 
+                                                  ? 'Super Admin'
+                                                  : (role == 'Role 1' ? 'Standard (Role 1)' : 'Admin (Role 2)'),
+                                              style: TextStyle(
+                                                fontFamily: 'Inter', 
+                                                fontSize: 10, 
+                                                fontWeight: FontWeight.bold,
+                                                color: isRowUserSuperAdmin ? const Color(0xFFF59E0B) : Colors.white70,
+                                              ),
+                                            ),
+                                          ),
+                                        const SizedBox(width: 8),
+                                        // Status button
+                                        if (isCurrentUserSuperAdmin && !isRowUserSuperAdmin)
+                                          ElevatedButton(
+                                            style: ElevatedButton.styleFrom(
+                                              backgroundColor: isRevoked ? const Color(0xFF10B981) : const Color(0xFFEF4444),
+                                              foregroundColor: Colors.white,
+                                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+                                            ),
+                                            onPressed: () => _toggleChildStatus(email, status),
+                                            child: Text(
+                                              isRevoked ? 'Activate' : 'Revoke',
+                                              style: const TextStyle(fontFamily: 'Inter', fontSize: 10, fontWeight: FontWeight.bold),
+                                            ),
+                                          )
+                                        else
+                                          Container(
+                                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                                            decoration: BoxDecoration(
+                                              color: isRevoked ? const Color(0xFFEF4444).withOpacity(0.2) : const Color(0xFF10B981).withOpacity(0.2),
+                                              borderRadius: BorderRadius.circular(6),
+                                              border: Border.all(color: isRevoked ? const Color(0xFFEF4444) : const Color(0xFF10B981)),
+                                            ),
+                                            child: Text(
+                                              isRevoked ? 'Revoked' : 'Active',
+                                              style: TextStyle(
+                                                fontFamily: 'Inter', 
+                                                fontSize: 10, 
+                                                fontWeight: FontWeight.bold,
+                                                color: isRevoked ? const Color(0xFFEF4444) : const Color(0xFF10B981),
+                                              ),
+                                            ),
+                                          ),
+                                      ],
+                                    ),
+                                  ],
+                                ),
+                              ],
+                            );
+                          },
+                        ),
+                    ],
+                  ),
+                ),
+              ),
+              if (isCurrentUserSuperAdmin) ...[
+                const SizedBox(width: 24),
+                Expanded(
+                  flex: 2,
+                  child: Container(
+                    padding: const EdgeInsets.all(20),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF1E1E22),
+                      borderRadius: BorderRadius.circular(16),
+                      border: Border.all(color: const Color(0xFF27272A)),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          'Authorized Parent Admins',
+                          style: TextStyle(fontFamily: 'Inter', fontSize: 14, fontWeight: FontWeight.bold, color: Color(0xFFEF4444)),
+                        ),
+                        const SizedBox(height: 16),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: TextField(
+                                controller: _parentEmailController,
+                                style: const TextStyle(fontFamily: 'Inter', fontSize: 13, color: Colors.white),
+                                decoration: InputDecoration(
+                                  hintText: 'Enter parent admin email',
+                                  hintStyle: const TextStyle(color: Color(0xFF52525B)),
+                                  fillColor: const Color(0xFF0F0F12),
+                                  filled: true,
+                                  contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                                  enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: const BorderSide(color: Color(0xFF27272A))),
+                                  focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: const BorderSide(color: Color(0xFFEF4444))),
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 10),
+                            ElevatedButton(
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: const Color(0xFFEF4444),
+                                foregroundColor: Colors.white,
+                                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
+                                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                              ),
+                              onPressed: _addParentEmail,
+                              child: const Icon(Icons.add, size: 16),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 18),
+                        ListView.separated(
+                          shrinkWrap: true,
+                          physics: const NeverScrollableScrollPhysics(),
+                          itemCount: _parentEmails.length,
+                          separatorBuilder: (context, index) => const Divider(color: Color(0xFF27272A), height: 12),
+                          itemBuilder: (context, index) {
+                            final email = _parentEmails[index];
+                            final isPrimary = email == 'pavan.yadav@businessnext.com';
+
+                            return Row(
+                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                              children: [
+                                Expanded(
+                                  child: Text(
+                                    email,
+                                    style: const TextStyle(fontFamily: 'Inter', fontSize: 13, color: Colors.white),
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                ),
+                                if (isPrimary)
+                                  const Text(
+                                    'Primary Owner',
+                                    style: TextStyle(fontFamily: 'Inter', fontSize: 10, color: Color(0xFF52525B), fontWeight: FontWeight.bold),
+                                  )
+                                else
+                                  IconButton(
+                                    icon: const Icon(Icons.delete_outline_rounded, size: 16, color: Color(0xFFEF4444)),
+                                    constraints: const BoxConstraints(),
+                                    padding: EdgeInsets.zero,
+                                    onPressed: () => _removeParentEmail(email),
+                                  ),
+                              ],
+                            );
+                          },
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildCertsTab() {
+    return SingleChildScrollView(
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Expanded(
+            flex: 3,
+            child: Container(
+              padding: const EdgeInsets.all(20),
+              decoration: BoxDecoration(
+                color: const Color(0xFF1E1E22),
+                borderRadius: BorderRadius.circular(16),
+                border: Border.all(color: const Color(0xFF27272A)),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      _buildFormTab('ios', 'Apple iOS'),
+                      const SizedBox(width: 8),
+                      _buildFormTab('android', 'Google Android'),
+                    ],
+                  ),
+                  const SizedBox(height: 20),
+                  _buildInputField(label: 'Certificate Name (e.g. Enterprise Dist)', controller: _certNameController, hint: 'Friendly label name'),
+                  const SizedBox(height: 12),
+                  if (_certPlatform == 'ios') ...[
+                    _buildPathPickerField(label: 'P12 Certificate Path', controller: _p12PathController, hint: '/path/to/cert.p12', type: 'p12'),
+                    const SizedBox(height: 12),
+                    _buildInputField(label: 'P12 Password', controller: _p12PasswordController, hint: 'p12 password', obscure: true),
+                    const SizedBox(height: 12),
+                    _buildPathPickerField(label: 'Provisioning Profile Path', controller: _provPathController, hint: '/path/to/profile.mobileprovision', type: 'mobileprovision'),
+                    const SizedBox(height: 12),
+                    _buildInputField(label: 'Keychain Password', controller: _keychainPasswordController, hint: 'macOS Keychain Password', obscure: true),
+                    const SizedBox(height: 12),
+                    _buildInputField(label: 'Signing Identity (Exact name matching cert)', controller: _identityController, hint: 'Apple Distribution: Company Name (ID)'),
+                  ] else ...[
+                    _buildPathPickerField(label: 'Keystore Path', controller: _keystorePathController, hint: '/path/to/release.keystore', type: 'keystore'),
+                    const SizedBox(height: 12),
+                    _buildInputField(label: 'Key Alias', controller: _keyAliasController, hint: 'e.g. key0'),
+                    const SizedBox(height: 12),
+                    _buildInputField(label: 'Key Password', controller: _keyPasswordController, hint: 'key alias password', obscure: true),
+                    const SizedBox(height: 12),
+                    _buildInputField(label: 'Keystore Password', controller: _storePasswordController, hint: 'keystore password', obscure: true),
+                  ],
+                  const SizedBox(height: 20),
+                  SizedBox(
+                    width: double.infinity,
+                    height: 46,
+                    child: ElevatedButton.icon(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFFEF4444),
+                        foregroundColor: Colors.white,
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                      ),
+                      icon: const Icon(Icons.cloud_upload_rounded, size: 16),
+                      label: const Text('Publish Global Certificate', style: TextStyle(fontFamily: 'Inter', fontWeight: FontWeight.bold, fontSize: 13)),
+                      onPressed: _publishGlobalCertificate,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(width: 24),
+          Expanded(
+            flex: 3,
+            child: Container(
+              padding: const EdgeInsets.all(20),
+              decoration: BoxDecoration(
+                color: const Color(0xFF1E1E22),
+                borderRadius: BorderRadius.circular(16),
+                border: Border.all(color: const Color(0xFF27272A)),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Active Distributed Keys',
+                    style: TextStyle(fontFamily: 'Inter', fontSize: 14, fontWeight: FontWeight.bold, color: Color(0xFFEF4444)),
+                  ),
+                  const SizedBox(height: 16),
+                  if (_globalCerts.isEmpty)
+                    const Padding(
+                      padding: EdgeInsets.symmetric(vertical: 36),
+                      child: Center(
+                        child: Text(
+                          'No distributed certificates in the vault.',
+                          style: TextStyle(fontFamily: 'Inter', fontSize: 13, color: Color(0xFF52525B)),
+                        ),
+                      ),
+                    )
+                  else
+                    ListView.separated(
+                      shrinkWrap: true,
+                      physics: const NeverScrollableScrollPhysics(),
+                      itemCount: _globalCerts.length,
+                      separatorBuilder: (context, index) => const Divider(color: Color(0xFF27272A), height: 16),
+                      itemBuilder: (context, index) {
+                        final cert = _globalCerts[index];
+                        final isIos = cert['platform'] == 'ios';
+
+                        return Row(
+                          children: [
+                            Icon(
+                              isIos ? Icons.phone_iphone_rounded : Icons.phone_android_rounded,
+                              color: isIos ? const Color(0xFF38BDF8) : const Color(0xFF10B981),
+                              size: 20,
+                            ),
+                            const SizedBox(width: 14),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    cert['name'] ?? '',
+                                    style: const TextStyle(fontFamily: 'Inter', fontSize: 13, fontWeight: FontWeight.bold, color: Colors.white),
+                                  ),
+                                  const SizedBox(height: 2),
+                                  Text(
+                                    isIos ? 'P12: ${p.basename(cert['p12Path'] ?? "")}' : 'Keystore: ${p.basename(cert['keystorePath'] ?? "")}',
+                                    style: const TextStyle(fontFamily: 'Courier', fontSize: 10, color: Color(0xFF71717A)),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            IconButton(
+                              icon: const Icon(Icons.delete_outline_rounded, color: Color(0xFFEF4444)),
+                              onPressed: () => _removeGlobalCertificate(cert['id']),
+                            ),
+                          ],
+                        );
+                      },
+                    ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildFormTab(String value, String title) {
+    final active = _certPlatform == value;
+    return InkWell(
+      onTap: () => setState(() => _certPlatform = value),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+        decoration: BoxDecoration(
+          color: active ? const Color(0xFFEF4444) : Colors.transparent,
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Text(
+          title,
+          style: TextStyle(fontFamily: 'Inter', fontSize: 12, fontWeight: active ? FontWeight.bold : FontWeight.normal, color: active ? Colors.white : const Color(0xFFA1A1AA)),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildInputField({required String label, required TextEditingController controller, String hint = '', bool obscure = false}) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(label, style: const TextStyle(fontFamily: 'Inter', fontSize: 12, color: Color(0xFFA1A1AA))),
+        const SizedBox(height: 6),
+        TextField(
+          controller: controller,
+          obscureText: obscure,
+          style: const TextStyle(fontFamily: 'Inter', fontSize: 13, color: Colors.white),
+          decoration: InputDecoration(
+            hintText: hint,
+            hintStyle: const TextStyle(color: Color(0xFF52525B)),
+            fillColor: const Color(0xFF0F0F12),
+            filled: true,
+            contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: const BorderSide(color: Color(0xFF27272A))),
+            focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: const BorderSide(color: Color(0xFFEF4444))),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildPathPickerField({required String label, required TextEditingController controller, String hint = '', required String type}) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(label, style: const TextStyle(fontFamily: 'Inter', fontSize: 12, color: Color(0xFFA1A1AA))),
+        const SizedBox(height: 6),
+        Row(
+          children: [
+            Expanded(
+              child: TextField(
+                controller: controller,
+                style: const TextStyle(fontFamily: 'Courier', fontSize: 12, color: Colors.white),
+                decoration: InputDecoration(
+                  hintText: hint,
+                  hintStyle: const TextStyle(color: Color(0xFF52525B)),
+                  fillColor: const Color(0xFF0F0F12),
+                  filled: true,
+                  contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                  enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: const BorderSide(color: Color(0xFF27272A))),
+                  focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: const BorderSide(color: Color(0xFFEF4444))),
+                ),
+              ),
+            ),
+            const SizedBox(width: 8),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFF27272A),
+                foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 14),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+              ),
+              onPressed: () => _pickPath(controller, type),
+              child: const Text('Browse', style: TextStyle(fontFamily: 'Inter', fontSize: 11)),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _buildAlertsTab() {
+    final List<String> targets = ['All', ..._childUsers.keys];
+
+    return SingleChildScrollView(
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Expanded(
+            flex: 3,
+            child: Container(
+              padding: const EdgeInsets.all(20),
+              decoration: BoxDecoration(
+                color: const Color(0xFF1E1E22),
+                borderRadius: BorderRadius.circular(16),
+                border: Border.all(color: const Color(0xFF27272A)),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Compose Notification Banner',
+                    style: TextStyle(fontFamily: 'Inter', fontSize: 14, fontWeight: FontWeight.bold, color: Color(0xFFEF4444)),
+                  ),
+                  const SizedBox(height: 16),
+                  const Text('Recipient Target', style: TextStyle(fontFamily: 'Inter', fontSize: 12, color: Color(0xFFA1A1AA))),
+                  const SizedBox(height: 6),
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.symmetric(horizontal: 12),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF0F0F12),
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: const Color(0xFF27272A)),
+                    ),
+                    child: DropdownButtonHideUnderline(
+                      child: DropdownButton<String>(
+                        value: _alertTarget,
+                        dropdownColor: const Color(0xFF1E1E22),
+                        isExpanded: true,
+                        items: targets
+                            .map((t) => DropdownMenuItem(
+                                  value: t,
+                                  child: Text(t, style: const TextStyle(fontFamily: 'Inter', fontSize: 13, color: Colors.white)),
+                                ))
+                            .toList(),
+                        onChanged: (val) {
+                          if (val != null) {
+                            setState(() => _alertTarget = val);
+                          }
+                        },
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  const Text('Priority Level', style: TextStyle(fontFamily: 'Inter', fontSize: 12, color: Color(0xFFA1A1AA))),
+                  const SizedBox(height: 6),
+                  Row(
+                    children: [
+                      _buildPriorityTab('High'),
+                      const SizedBox(width: 8),
+                      _buildPriorityTab('Medium'),
+                      const SizedBox(width: 8),
+                      _buildPriorityTab('Low'),
+                    ],
+                  ),
+                  const SizedBox(height: 14),
+                  _buildInputField(label: 'Message', controller: _alertMessageController, hint: 'Enter notification description...'),
+                  const SizedBox(height: 20),
+                  SizedBox(
+                    width: double.infinity,
+                    height: 46,
+                    child: ElevatedButton.icon(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFFEF4444),
+                        foregroundColor: Colors.white,
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                      ),
+                      icon: const Icon(Icons.send_rounded, size: 16),
+                      label: const Text('Send Alert Now', style: TextStyle(fontFamily: 'Inter', fontWeight: FontWeight.bold, fontSize: 13)),
+                      onPressed: _sendAlert,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(width: 24),
+          const Expanded(
+            flex: 3,
+            child: SizedBox(),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildPriorityTab(String value) {
+    final active = _alertPriority == value;
+    Color priorityColor = const Color(0xFF8B5CF6);
+    if (value == 'High') priorityColor = const Color(0xFFEF4444);
+    else if (value == 'Medium') priorityColor = const Color(0xFFF59E0B);
+
+    return InkWell(
+      onTap: () => setState(() => _alertPriority = value),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+        decoration: BoxDecoration(
+          color: active ? priorityColor : Colors.transparent,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: priorityColor.withOpacity(0.5)),
+        ),
+        child: Text(
+          value,
+          style: TextStyle(fontFamily: 'Inter', fontSize: 12, fontWeight: active ? FontWeight.bold : FontWeight.normal, color: active ? Colors.white : priorityColor),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildLogsTab() {
+    return Container(
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1E1E22),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: const Color(0xFF27272A)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              const Text(
+                'SignNext Audit Trail',
+                style: TextStyle(fontFamily: 'Inter', fontSize: 14, fontWeight: FontWeight.bold, color: Color(0xFFEF4444)),
+              ),
+              IconButton(
+                icon: const Icon(Icons.refresh_rounded, size: 16, color: Color(0xFFEF4444)),
+                onPressed: _refreshData,
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
+          Expanded(
+            child: _auditLogs.isEmpty
+                ? const Center(
+                    child: Text(
+                      'No system logs available.',
+                      style: TextStyle(fontFamily: 'Inter', fontSize: 13, color: Color(0xFF52525B)),
+                    ),
+                  )
+                : ListView.separated(
+                    itemCount: _auditLogs.length,
+                    separatorBuilder: (context, index) => const Divider(color: Color(0xFF27272A), height: 16),
+                    itemBuilder: (context, index) {
+                      final log = _auditLogs[index];
+                      return Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Icon(Icons.history_rounded, size: 16, color: Color(0xFFEF4444)),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                RichText(
+                                  text: TextSpan(
+                                    style: const TextStyle(fontFamily: 'Inter', fontSize: 12, color: Colors.white70),
+                                    children: [
+                                      TextSpan(text: log['email'] ?? '', style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.white)),
+                                      TextSpan(text: ' performed '),
+                                      TextSpan(text: log['action'] ?? '', style: const TextStyle(fontWeight: FontWeight.bold, color: Color(0xFFEF4444))),
+                                    ],
+                                  ),
+                                ),
+                                const SizedBox(height: 4),
+                                Text(
+                                  log['details'] ?? '',
+                                  style: const TextStyle(fontFamily: 'Inter', fontSize: 12, color: Color(0xFFA1A1AA)),
+                                ),
+                                const SizedBox(height: 4),
+                                Text(
+                                  'Device: ${log['deviceName']} • OS: ${log['osVersion']}',
+                                  style: const TextStyle(fontFamily: 'Inter', fontSize: 10, color: Color(0xFF52525B)),
+                                ),
+                              ],
+                            ),
+                          ),
+                          const SizedBox(width: 12),
+                          Text(
+                            log['timestamp'] != null
+                                ? log['timestamp'].toString().substring(11, 19)
+                                : '',
+                            style: const TextStyle(fontFamily: 'Courier', fontSize: 10, color: Color(0xFF71717A)),
+                          ),
+                        ],
+                      );
+                    },
+                  ),
+          ),
+        ],
+      ),
+    );
   }
 }

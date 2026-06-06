@@ -150,7 +150,7 @@ class MetadataService {
       return parseFromFilename(p.basename(apkPath));
     } finally {
       if (tempDir != null && await tempDir.exists()) {
-        await tempDir.delete(recursive: true).catchError((_) {});
+        await tempDir.delete(recursive: true).catchError((_) => tempDir!);
       }
     }
   }
