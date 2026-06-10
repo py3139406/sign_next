@@ -22,6 +22,10 @@ class SigningProfile {
   final String zipalignPath;
   final String apksignerJarPath;
 
+  // FCM credentials
+  final String fcmServerKey;
+  final String fcmServiceAccountPath;
+
   SigningProfile({
     required this.id,
     required this.name,
@@ -38,6 +42,8 @@ class SigningProfile {
     this.storePassword = '',
     this.zipalignPath = '',
     this.apksignerJarPath = '',
+    this.fcmServerKey = '',
+    this.fcmServiceAccountPath = '',
   });
 
   Map<String, dynamic> toJson() => {
@@ -56,6 +62,8 @@ class SigningProfile {
     'storePassword': storePassword,
     'zipalignPath': zipalignPath,
     'apksignerJarPath': apksignerJarPath,
+    'fcmServerKey': fcmServerKey,
+    'fcmServiceAccountPath': fcmServiceAccountPath,
   };
 
   factory SigningProfile.fromJson(Map<String, dynamic> json) => SigningProfile(
@@ -74,6 +82,8 @@ class SigningProfile {
     storePassword: json['storePassword'] ?? '',
     zipalignPath: json['zipalignPath'] ?? '',
     apksignerJarPath: json['apksignerJarPath'] ?? '',
+    fcmServerKey: json['fcmServerKey'] ?? '',
+    fcmServiceAccountPath: json['fcmServiceAccountPath'] ?? '',
   );
 }
 
@@ -85,11 +95,17 @@ class VaultService {
     try {
       final prefs = await SharedPreferences.getInstance();
       final jsonStr = prefs.getString(_profilesKey);
-      if (jsonStr == null) return [];
+      if (jsonStr == null) {
+        print("VaultService: no profiles found under key '$_profilesKey'");
+        return [];
+      }
       
       final List<dynamic> list = json.decode(jsonStr);
-      return list.map((item) => SigningProfile.fromJson(item)).toList();
-    } catch (_) {
+      final profiles = list.map((item) => SigningProfile.fromJson(item)).toList();
+      print("VaultService: successfully parsed ${profiles.length} profiles.");
+      return profiles;
+    } catch (e, stack) {
+      print("VaultService Error loading profiles: $e\n$stack");
       return [];
     }
   }

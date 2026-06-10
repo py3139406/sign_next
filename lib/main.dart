@@ -22,6 +22,11 @@ import 'services/sharing_server.dart';
 import 'services/vault_service.dart';
 import 'services/client_service.dart';
 import 'services/metadata_service.dart';
+import 'user_guide_widget.dart';
+import 'diff_checker_widget.dart';
+import 'json_utility_widget.dart';
+import 'security_guard_widget.dart';
+import 'push_notification_widget.dart';
 
 void main() {
   runApp(const SignNextApp());
@@ -258,7 +263,7 @@ class _PlatformDispatcherScreenState extends State<PlatformDispatcherScreen> {
   }
 }
 
-enum AppTab { sign, unsign, qrUtility, vault, devOps }
+enum AppTab { sign, unsign, qrUtility, vault, devOps, userGuide, diffChecker, jsonBlob, secGuard, push }
 
 // =============================================================================
 // DESKTOP INTERFACE
@@ -737,6 +742,25 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     _buildSidebarItem(tab: AppTab.qrUtility, icon: Icons.qr_code_scanner_rounded, label: 'QR Utility', subtitle: 'Convert QR and text'),
                     _buildSidebarItem(tab: AppTab.vault, icon: Icons.admin_panel_settings_rounded, label: 'Profile Vault', subtitle: 'Manage secure credentials'),
                     _buildSidebarItem(tab: AppTab.devOps, icon: Icons.developer_board_rounded, label: 'DevOps Center', subtitle: 'Azure DevOps & AI Reporting'),
+                    const Divider(color: Color(0xFF27272A), height: 16),
+                    const Padding(
+                      padding: EdgeInsets.symmetric(horizontal: 20.0, vertical: 6.0),
+                      child: Text(
+                        'DEVELOPER UTILITIES',
+                        style: TextStyle(
+                          fontFamily: 'Inter',
+                          fontSize: 10,
+                          fontWeight: FontWeight.bold,
+                          color: Color(0xFF8B5CF6),
+                          letterSpacing: 1.0,
+                        ),
+                      ),
+                    ),
+                    _buildSidebarItem(tab: AppTab.userGuide, icon: Icons.help_outline_rounded, label: 'User Guide', subtitle: 'Codesign steps & keystore setup'),
+                    _buildSidebarItem(tab: AppTab.diffChecker, icon: Icons.compare_rounded, label: 'Diff Checker', subtitle: 'Side-by-side text comparisons'),
+                    _buildSidebarItem(tab: AppTab.jsonBlob, icon: Icons.code_rounded, label: 'JSON Utility', subtitle: 'Validate, fix, & view JSON'),
+                    _buildSidebarItem(tab: AppTab.secGuard, icon: Icons.shield_outlined, label: 'Security Shield', subtitle: 'Anti-tampering code generator'),
+                    _buildSidebarItem(tab: AppTab.push, icon: Icons.notification_important_rounded, label: 'Push Studio', subtitle: 'Send APNs & FCM notifications'),
                     
                     const Divider(color: Color(0xFF27272A), height: 16),
           
@@ -1096,6 +1120,26 @@ class _DashboardScreenState extends State<DashboardScreen> {
         title = 'DevOps Center';
         desc = 'Manage Azure DevOps tasks, pull requests, and generate AI reports.';
         break;
+      case AppTab.userGuide:
+        title = 'User Guide & Help Center';
+        desc = 'Step-by-step walkthroughs and commands for iOS and Android signing.';
+        break;
+      case AppTab.diffChecker:
+        title = 'Code Diff Checker';
+        desc = 'Compare code blocks side-by-side and highlight additions/deletions.';
+        break;
+      case AppTab.jsonBlob:
+        title = 'JSON Blob Utility';
+        desc = 'Paste, validate, auto-fix errors, and explore structured JSON tree views.';
+        break;
+      case AppTab.secGuard:
+        title = 'Security Shield';
+        desc = 'Protect your mobile apps against signature tampering and unauthorized re-signing.';
+        break;
+      case AppTab.push:
+        title = 'Push Studio';
+        desc = 'Send and test APNs (iOS) and FCM (Android) push notifications on physical devices.';
+        break;
     }
 
     return Container(
@@ -1189,6 +1233,19 @@ class _DashboardScreenState extends State<DashboardScreen> {
         );
       case AppTab.devOps:
         return const DevOpsWidget();
+      case AppTab.userGuide:
+        return const UserGuideWidget();
+      case AppTab.diffChecker:
+        return const DiffCheckerWidget();
+      case AppTab.jsonBlob:
+        return const JsonUtilityWidget();
+      case AppTab.secGuard:
+        return const SecurityGuardWidget();
+      case AppTab.push:
+        return PushNotificationWidget(
+          profiles: _profiles,
+          vaultService: _vaultService,
+        );
     }
   }
 
@@ -4006,11 +4063,28 @@ class _VaultWidgetState extends State<VaultWidget> {
   String? _androidKeystorePath;
   final _androidZipalignController = TextEditingController();
   final _androidApksignerController = TextEditingController();
+  final _androidFcmServerKeyController = TextEditingController();
+  String? _androidFcmSaPath;
 
   @override
   void initState() {
     super.initState();
     _loadProfiles();
+  }
+
+  @override
+  void dispose() {
+    _profileNameController.dispose();
+    _iosBundleIdController.dispose();
+    _iosP12PasswordController.dispose();
+    _iosKeychainPasswordController.dispose();
+    _androidKeyAliasController.dispose();
+    _androidKeyPasswordController.dispose();
+    _androidStorePasswordController.dispose();
+    _androidZipalignController.dispose();
+    _androidApksignerController.dispose();
+    _androidFcmServerKeyController.dispose();
+    super.dispose();
   }
 
   Future<void> _loadProfiles() async {
@@ -4035,6 +4109,8 @@ class _VaultWidgetState extends State<VaultWidget> {
     _androidKeystorePath = null;
     _androidZipalignController.clear();
     _androidApksignerController.clear();
+    _androidFcmServerKeyController.clear();
+    _androidFcmSaPath = null;
   }
 
   void _startEdit(SigningProfile? profile) {
@@ -4066,6 +4142,8 @@ class _VaultWidgetState extends State<VaultWidget> {
           _androidStorePasswordController.text = profile.storePassword;
           _androidZipalignController.text = profile.zipalignPath;
           _androidApksignerController.text = profile.apksignerJarPath;
+          _androidFcmServerKeyController.text = profile.fcmServerKey;
+          _androidFcmSaPath = profile.fcmServiceAccountPath.isNotEmpty ? profile.fcmServiceAccountPath : null;
         }
       });
     }
@@ -4077,6 +4155,7 @@ class _VaultWidgetState extends State<VaultWidget> {
     if (type == 'p12') allowedExtensions = ['p12'];
     else if (type == 'mobileprovision') allowedExtensions = ['mobileprovision'];
     else if (type == 'keystore') allowedExtensions = ['keystore', 'jks', 'pfx'];
+    else if (type == 'json') allowedExtensions = ['json'];
 
     result = await FilePicker.platform.pickFiles(type: allowedExtensions != null ? FileType.custom : FileType.any, allowedExtensions: allowedExtensions);
     if (result != null && result.files.single.path != null) {
@@ -4116,6 +4195,8 @@ class _VaultWidgetState extends State<VaultWidget> {
         storePassword: _androidStorePasswordController.text,
         zipalignPath: _androidZipalignController.text.trim(),
         apksignerJarPath: _androidApksignerController.text.trim(),
+        fcmServerKey: _androidFcmServerKeyController.text.trim(),
+        fcmServiceAccountPath: _androidFcmSaPath ?? '',
       );
     }
 
@@ -4399,6 +4480,7 @@ class _VaultWidgetState extends State<VaultWidget> {
 
   Widget _buildAndroidForm() {
     return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         _buildFilePickerField(
           label: 'Keystore / JKS File',
@@ -4430,6 +4512,26 @@ class _VaultWidgetState extends State<VaultWidget> {
           controller: _androidApksignerController,
           hint: 'Select apksigner.jar file',
           extensions: ['jar'],
+        ),
+        const SizedBox(height: 20),
+        const Divider(color: Color(0xFF27272A)),
+        const SizedBox(height: 12),
+        const Text(
+          'FCM Push Credentials (Optional)',
+          style: TextStyle(fontFamily: 'Inter', fontSize: 13, fontWeight: FontWeight.bold, color: Colors.white70),
+        ),
+        const SizedBox(height: 14),
+        _buildFilePickerField(
+          label: 'Firebase Service Account JSON File',
+          path: _androidFcmSaPath,
+          hint: 'Select Firebase service account key .json file',
+          onPick: () => _pickFile(type: 'json', onPicked: (path) => setState(() => _androidFcmSaPath = path)),
+        ),
+        const SizedBox(height: 14),
+        _buildInputField(
+          label: 'FCM Server Key (Legacy)',
+          controller: _androidFcmServerKeyController,
+          hint: 'Enter legacy server key if not using Service Account JSON',
         ),
       ],
     );
