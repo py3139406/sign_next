@@ -14,6 +14,7 @@ import 'package:path/path.dart' as p;
 import 'package:image/image.dart' as img;
 import 'package:zxing2/qrcode.dart';
 import 'package:http/http.dart' as http;
+import 'package:desktop_drop/desktop_drop.dart';
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 
