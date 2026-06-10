@@ -7766,6 +7766,7 @@ class _QrUtilityWidgetState extends State<QrUtilityWidget> {
   String? _decodedText;
   bool _isDecoding = false;
   String? _decodeError;
+  bool _isDraggingOver = false;
 
   @override
   void initState() {
@@ -7867,26 +7868,15 @@ class _QrUtilityWidgetState extends State<QrUtilityWidget> {
   }
 
   // QR Decoding actions
-  Future<void> _pickAndDecodeQrImage() async {
+  Future<void> _decodeQrImage(String filePath) async {
+    setState(() {
+      _selectedImagePath = filePath;
+      _isDecoding = true;
+      _decodedText = null;
+      _decodeError = null;
+    });
+
     try {
-      final result = await FilePicker.platform.pickFiles(
-        type: FileType.custom,
-        allowedExtensions: ['png', 'jpg', 'jpeg'],
-      );
-
-      if (result == null || result.files.single.path == null) {
-        return;
-      }
-
-      final filePath = result.files.single.path!;
-
-      setState(() {
-        _selectedImagePath = filePath;
-        _isDecoding = true;
-        _decodedText = null;
-        _decodeError = null;
-      });
-
       // Run decoding in isolate to keep UI butter smooth
       final decoded = await compute(_decodeQrIsolate, filePath);
 
@@ -7902,6 +7892,26 @@ class _QrUtilityWidgetState extends State<QrUtilityWidget> {
       setState(() {
         _isDecoding = false;
         _decodeError = "Error reading image file: $e";
+      });
+    }
+  }
+
+  Future<void> _pickAndDecodeQrImage() async {
+    try {
+      final result = await FilePicker.platform.pickFiles(
+        type: FileType.custom,
+        allowedExtensions: ['png', 'jpg', 'jpeg'],
+      );
+
+      if (result == null || result.files.single.path == null) {
+        return;
+      }
+
+      await _decodeQrImage(result.files.single.path!);
+    } catch (e) {
+      setState(() {
+        _isDecoding = false;
+        _decodeError = "Error selecting image file: $e";
       });
     }
   }
@@ -8187,7 +8197,7 @@ class _QrUtilityWidgetState extends State<QrUtilityWidget> {
           ),
           const SizedBox(height: 6),
           const Text(
-            'Upload a QR Code image file to decode and extract its original text content.',
+            'Upload or drag and drop a QR Code image file to decode and extract its original text content.',
             style: TextStyle(
               fontFamily: 'Inter',
               fontSize: 12,
@@ -8195,73 +8205,126 @@ class _QrUtilityWidgetState extends State<QrUtilityWidget> {
             ),
           ),
           const SizedBox(height: 20),
-          InkWell(
-            onTap: _isDecoding ? null : _pickAndDecodeQrImage,
-            borderRadius: BorderRadius.circular(12),
-            child: Container(
-              height: 220,
-              width: double.infinity,
-              decoration: BoxDecoration(
-                color: const Color(0xFF0F0F12),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(
-                  color: _selectedImagePath != null ? const Color(0xFF10B981) : const Color(0xFF27272A),
-                  width: 1.5,
+          DropTarget(
+            onDragEntered: (details) {
+              setState(() {
+                _isDraggingOver = true;
+              });
+            },
+            onDragExited: (details) {
+              setState(() {
+                _isDraggingOver = false;
+              });
+            },
+            onDragDone: (details) async {
+              setState(() {
+                _isDraggingOver = false;
+              });
+              if (details.files.isNotEmpty) {
+                final file = details.files.first;
+                final filePath = file.path;
+                final ext = p.extension(filePath).toLowerCase();
+                if (ext == '.png' || ext == '.jpg' || ext == '.jpeg' || ext == '.gif') {
+                  await _decodeQrImage(filePath);
+                } else {
+                  if (mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: Text('Invalid file format: ${p.basename(filePath)}. Only PNG, JPG, JPEG, and GIF images are supported.'),
+                        backgroundColor: const Color(0xFFEF4444),
+                      ),
+                    );
+                  }
+                }
+              }
+            },
+            child: InkWell(
+              onTap: _isDecoding ? null : _pickAndDecodeQrImage,
+              borderRadius: BorderRadius.circular(12),
+              child: Container(
+                height: 220,
+                width: double.infinity,
+                decoration: BoxDecoration(
+                  color: _isDraggingOver ? const Color(0xFF132D20) : const Color(0xFF0F0F12),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(
+                    color: _isDraggingOver
+                        ? const Color(0xFF10B981)
+                        : (_selectedImagePath != null ? const Color(0xFF10B981) : const Color(0xFF27272A)),
+                    width: _isDraggingOver ? 2.0 : 1.5,
+                  ),
                 ),
-              ),
-              child: _selectedImagePath == null
-                  ? Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: const [
-                        Icon(Icons.cloud_upload_outlined, size: 36, color: Color(0xFF71717A)),
-                        SizedBox(height: 12),
-                        Text(
-                          'Upload QR Code Image',
-                          style: TextStyle(
-                            fontFamily: 'Inter',
-                            fontSize: 13,
-                            color: Colors.white,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                        SizedBox(height: 4),
-                        Text(
-                          'Supports PNG, JPG, JPEG',
-                          style: TextStyle(
-                            fontFamily: 'Inter',
-                            fontSize: 11,
-                            color: Color(0xFF52525B),
-                          ),
-                        ),
-                      ],
-                    )
-                  : Padding(
-                      padding: const EdgeInsets.all(16.0),
-                      child: Column(
-                        children: [
-                          Expanded(
-                            child: ClipRRect(
-                              borderRadius: BorderRadius.circular(8),
-                              child: Image.file(
-                                File(_selectedImagePath!),
-                                fit: BoxFit.contain,
-                              ),
-                            ),
-                          ),
-                          const SizedBox(height: 10),
+                child: _isDraggingOver
+                    ? Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: const [
+                          Icon(Icons.downloading_rounded, size: 48, color: Color(0xFF10B981)),
+                          SizedBox(height: 12),
                           Text(
-                            p.basename(_selectedImagePath!),
-                            style: const TextStyle(
-                              fontFamily: 'Courier',
-                              fontSize: 11,
-                              color: Color(0xFFA1A1AA),
+                            'Drop QR Image Here!',
+                            style: TextStyle(
+                              fontFamily: 'Inter',
+                              fontSize: 14,
+                              color: Color(0xFF10B981),
+                              fontWeight: FontWeight.bold,
                             ),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
                           ),
                         ],
-                      ),
-                    ),
+                      )
+                    : (_selectedImagePath == null
+                        ? Column(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: const [
+                              Icon(Icons.cloud_upload_outlined, size: 36, color: Color(0xFF71717A)),
+                              SizedBox(height: 12),
+                              Text(
+                                'Upload or Drag & Drop Image',
+                                style: TextStyle(
+                                  fontFamily: 'Inter',
+                                  fontSize: 13,
+                                  color: Colors.white,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                              SizedBox(height: 4),
+                              Text(
+                                'Supports PNG, JPG, JPEG',
+                                style: TextStyle(
+                                  fontFamily: 'Inter',
+                                  fontSize: 11,
+                                  color: Color(0xFF52525B),
+                                ),
+                              ),
+                            ],
+                          )
+                        : Padding(
+                            padding: const EdgeInsets.all(16.0),
+                            child: Column(
+                              children: [
+                                Expanded(
+                                  child: ClipRRect(
+                                    borderRadius: BorderRadius.circular(8),
+                                    child: Image.file(
+                                      File(_selectedImagePath!),
+                                      fit: BoxFit.contain,
+                                    ),
+                                  ),
+                                ),
+                                const SizedBox(height: 10),
+                                Text(
+                                  p.basename(_selectedImagePath!),
+                                  style: const TextStyle(
+                                    fontFamily: 'Courier',
+                                    fontSize: 11,
+                                    color: Color(0xFFA1A1AA),
+                                  ),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ],
+                            ),
+                          )),
+              ),
             ),
           ),
           const SizedBox(height: 12),
