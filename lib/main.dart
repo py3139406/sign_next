@@ -738,10 +738,23 @@ class _DashboardScreenState extends State<DashboardScreen> {
                       ],
                       const Divider(color: Color(0xFF27272A), height: 16),
           
+                    const Padding(
+                      padding: EdgeInsets.symmetric(horizontal: 20.0, vertical: 6.0),
+                      child: Text(
+                        'STUDIO SUITE',
+                        style: TextStyle(
+                          fontFamily: 'Inter',
+                          fontSize: 10,
+                          fontWeight: FontWeight.bold,
+                          color: Color(0xFF8B5CF6),
+                          letterSpacing: 1.0,
+                        ),
+                      ),
+                    ),
                     _buildSidebarItem(tab: AppTab.sign, icon: Icons.vpn_key_rounded, label: 'Sign Studio', subtitle: 'Sign IPA, APK or AAB'),
                     _buildSidebarItem(tab: AppTab.unsign, icon: Icons.key_off_rounded, label: 'Unsign Studio', subtitle: 'Strip package signatures'),
-                    _buildSidebarItem(tab: AppTab.qrUtility, icon: Icons.qr_code_scanner_rounded, label: 'QR Utility', subtitle: 'Convert QR and text'),
                     _buildSidebarItem(tab: AppTab.vault, icon: Icons.admin_panel_settings_rounded, label: 'Profile Vault', subtitle: 'Manage secure credentials'),
+                    _buildSidebarItem(tab: AppTab.push, icon: Icons.notification_important_rounded, label: 'Push Studio', subtitle: 'Send APNs & FCM notifications'),
                     _buildSidebarItem(tab: AppTab.devOps, icon: Icons.developer_board_rounded, label: 'DevOps Center', subtitle: 'Azure DevOps & AI Reporting'),
                     const Divider(color: Color(0xFF27272A), height: 16),
                     const Padding(
@@ -757,11 +770,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
                         ),
                       ),
                     ),
+                    _buildSidebarItem(tab: AppTab.qrUtility, icon: Icons.qr_code_scanner_rounded, label: 'QR Utility', subtitle: 'Convert QR and text'),
                     _buildSidebarItem(tab: AppTab.userGuide, icon: Icons.help_outline_rounded, label: 'User Guide', subtitle: 'Codesign steps & keystore setup'),
                     _buildSidebarItem(tab: AppTab.diffChecker, icon: Icons.compare_rounded, label: 'Diff Checker', subtitle: 'Side-by-side text comparisons'),
                     _buildSidebarItem(tab: AppTab.jsonBlob, icon: Icons.code_rounded, label: 'JSON Utility', subtitle: 'Validate, fix, & view JSON'),
                     _buildSidebarItem(tab: AppTab.secGuard, icon: Icons.shield_outlined, label: 'Security Shield', subtitle: 'Anti-tampering code generator'),
-                    _buildSidebarItem(tab: AppTab.push, icon: Icons.notification_important_rounded, label: 'Push Studio', subtitle: 'Send APNs & FCM notifications'),
                     
                     const Divider(color: Color(0xFF27272A), height: 16),
           
@@ -10059,7 +10072,6 @@ class _ParentDashboardWidgetState extends State<ParentDashboardWidget> {
       ],
     );
   }
-
   Widget _buildAlertsTab() {
     final List<String> targets = ['All', ..._childUsers.keys];
 

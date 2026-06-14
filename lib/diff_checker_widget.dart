@@ -558,6 +558,24 @@ class _DiffCheckerWidgetState extends State<DiffCheckerWidget> {
             label: const Text('Clear', style: TextStyle(fontFamily: 'Inter', fontSize: 12)),
             onPressed: _clearAll,
           ),
+          if (_hasCompared) ...[
+            const SizedBox(width: 10),
+            ElevatedButton.icon(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFF27272A),
+                foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+              ),
+              icon: const Icon(Icons.edit_rounded, size: 16),
+              label: const Text('Edit Input', style: TextStyle(fontFamily: 'Inter', fontSize: 12)),
+              onPressed: () {
+                setState(() {
+                  _hasCompared = false;
+                });
+              },
+            ),
+          ],
           if (!_hasCompared) ...[
             const SizedBox(width: 10),
             ElevatedButton.icon(
